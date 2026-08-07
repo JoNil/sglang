@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm110_supported,
     is_sm120_supported,
     log_info_on_rank0,
     mxfp8_block_convert_required,
@@ -396,6 +397,15 @@ class Fp8Config(QuantizationConfig):
                 return Mxfp4HummingMoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+                # Thor SM110 adapts FlashInfer's Spark B12x W4A16 CuTeDSL
+                # kernel to DeepSeek's native E8M0-per-32 MXFP4 scales.
+                if is_sm110_supported():
+                    from sglang.srt.layers.quantization.mxfp4_flashinfer_thor_moe import (
+                        Mxfp4FlashinferThorMoEMethod,
+                    )
+
+                    return Mxfp4FlashinferThorMoEMethod(fp8_method, prefix=prefix)
+
                 # SM100 uses TRT-LLM; SM90 uses W4A16 and SM120 uses MXFP8xMXFP4.
                 if is_sm90_supported() or is_sm120_supported():
                     from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (

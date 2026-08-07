@@ -458,7 +458,9 @@ def should_use_dp_reduce_scatterv():
     Configurations with partial attention TP fall back to all-reduce + dp_scatter.
     """
     return (
-        not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        os.environ.get("SGLANG_THOR_DISABLE_DP_REDUCE_SCATTERV", "0").lower()
+        not in ("1", "true")
+        and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
         and get_parallel().attn_dp_size > 1

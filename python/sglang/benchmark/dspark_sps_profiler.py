@@ -1148,7 +1148,15 @@ def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTabl
         raise RuntimeError(
             f"Off-diagonal fit needs at least 4 cells, got {len(cells)}."
         )
-    bias, alpha, theta, _rel, _stats = ols_resid_backfit(cells)
+    # A 64-token bin is useful for large serving batches, but it collapses
+    # every budget of a small CUDA graph (for example TP2 DSpark gamma=6,
+    # where M is only 1..14) into the zero bin and discards the entire
+    # off-diagonal sweep. Preserve exact token costs for small graphs.
+    max_m = max(int(cell["M"]) for cell in cells)
+    mbin_w = 1 if max_m < 64 else 64
+    bias, alpha, theta, _rel, _stats = ols_resid_backfit(
+        cells, mbin_w=mbin_w
+    )
     bs_probes = sorted(alpha)
     m_probes = sorted(theta)
     return SpsAdditiveCostTable(

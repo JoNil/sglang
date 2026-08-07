@@ -830,11 +830,24 @@ def _prune_dual_scope_configs(configs, named_args, **kwargs):
     """Prune autotune configs for the dual-scope kernel.
 
     For h_q <= 64: restrict to BLOCK_H=16 only (BLOCK_H >= 32 causes
-    precision issues in online softmax due to different MFMA reduction orders).
+    precision issues in online softmax due to different MFMA reduction orders),
+    except for the SM110-validated h_q=64, BLOCK_H=32, BLOCK_N=64 tile. That
+    tile preserves the BLOCK_N=64 reduction order exactly while sharing each
+    gathered KV row across twice as many query heads.
     For h_q > 64: prune BLOCK_H > h_q (same grid size, worse register usage).
     """
     h_q = named_args.get("h_q", 128)
-    if h_q <= 64:
+    if h_q == 64:
+        pruned = [
+            c
+            for c in configs
+            if c.kwargs.get("BLOCK_H", 16) <= 16
+            or (
+                c.kwargs.get("BLOCK_H", 16) == 32
+                and c.kwargs.get("BLOCK_N", 64) == 64
+            )
+        ]
+    elif h_q < 64:
         pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= 16]
     else:
         pruned = [c for c in configs if c.kwargs.get("BLOCK_H", 16) <= h_q]

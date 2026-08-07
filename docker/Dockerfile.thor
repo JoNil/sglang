@@ -1,0 +1,38 @@
+# Jetson Thor development image.
+#
+# NVIDIA's Jetson-compatible SGLang image already contains the CUDA 13.3,
+# PyTorch, FlashInfer CuTeDSL, and aarch64 binary stack.  Overlay this fork's
+# Python sources so the SM110 kernel remains JIT-compiled for the actual Thor
+# instead of baking an SM121 cubin on another machine.
+ARG BASE_IMAGE=nvcr.io/nvidia/sglang:26.06-py3@sha256:f1e23b1c96d7e04d061c76b179f81aa32fcef367590a90f6079a0bf899dc4300
+FROM ${BASE_IMAGE}
+
+ARG VCS_REF=unknown
+LABEL org.opencontainers.image.title="JoNil SGLang for Jetson Thor" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.description="DeepSeek-V4 MXFP4 SM110 W4A16 kernel overlay"
+
+COPY python /opt/sglang-thor/python
+
+# Add an indexed SM100-family grouped-GEMM entry point. Decode routing passes
+# a compact list of active expert IDs, so CUTLASS no longer constructs and
+# schedules 256 expert groups when only a small subset has tokens.
+COPY flashinfer-indexed/group_gemm_mxfp4_groupwise_sm100.cuh \
+    /usr/local/lib/python3.12/dist-packages/flashinfer/data/include/flashinfer/gemm/group_gemm_mxfp4_groupwise_sm100.cuh
+COPY flashinfer-indexed/group_gemm_mxfp4_groupwise_sm100.cu \
+    flashinfer-indexed/group_gemm_mxfp4_groupwise_sm100_kernel_inst.jinja \
+    flashinfer-indexed/group_gemm_sm100_binding.cu \
+    flashinfer-indexed/group_gemm_mxfp4_indexed_thor.cu \
+    flashinfer-indexed/group_gemm_mxfp4_indexed_thor_binding.cu \
+    /usr/local/lib/python3.12/dist-packages/flashinfer/data/csrc/
+
+ENV PYTHONPATH=/opt/sglang-thor/python \
+    SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
+    SGLANG_THOR_CUDA_GRAPH_MAX_BS=2
+
+# Syntax-check the overlay without importing CUDA or creating a GPU context.
+RUN PYTHONPYCACHEPREFIX=/tmp/sglang-thor-pyc \
+    python -m compileall -q /opt/sglang-thor/python/sglang && \
+    rm -rf /tmp/sglang-thor-pyc
+
+WORKDIR /opt/sglang-thor

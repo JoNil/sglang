@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import msgspec
@@ -570,9 +571,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DSpark V4 draft requires markov_rank > 0, "
                 f"got markov_rank={dspark_config.markov_rank}."
             )
-        self.gamma = int(
+        checkpoint_gamma = int(
             dspark_config.resolve_gamma(default=int(config.num_hidden_layers))
         )
+        gamma_override = os.getenv("SGLANG_DSPARK_GAMMA_OVERRIDE")
+        self.gamma = int(gamma_override) if gamma_override else checkpoint_gamma
+        if self.gamma < 1:
+            raise ValueError(
+                f"SGLANG_DSPARK_GAMMA_OVERRIDE must be positive, got {self.gamma}."
+            )
+        if self.gamma != checkpoint_gamma:
+            logger.warning(
+                "Overriding DSpark draft gamma from checkpoint value %d to %d.",
+                checkpoint_gamma,
+                self.gamma,
+            )
         self.block_size = self.gamma
         if dspark_config.target_layer_ids is not None:
             self.num_stages = len(dspark_config.target_layer_ids)

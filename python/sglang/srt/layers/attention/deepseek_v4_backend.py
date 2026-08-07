@@ -71,7 +71,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm110_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -81,6 +81,8 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_is_sm110 = is_sm110_supported()
+_use_sm12x_flashmla_fallback = _is_sm120 or _is_sm110
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -136,7 +138,11 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    # Jetson Thor ships the legacy sgl-kernel FlashMLA ABI. It lacks the
+    # scheduler object and sparse-decode arguments required by DeepSeek V4.
+    # Use SGLang's graph-safe Triton SM12x sparse-MLA implementation on SM110,
+    # just as consumer Blackwell does on SM120.
+    if _use_sm12x_flashmla_fallback or _is_xpu:
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -1701,7 +1707,7 @@ class DeepseekV4AttnBackend(
             # sparse_prefill_fwd does not support SM120.
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
-                and not _is_sm120
+                and not _use_sm12x_flashmla_fallback
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1717,7 +1723,29 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if _is_sm110:
+                # Thor has only 20 SMs.  The SM120 fallback launches one
+                # program per (batch, head) and handles the SWA and compressed
+                # scopes separately, which badly under-fills SM110 at decode
+                # batch sizes 1-2.  The split-K DSV4 kernel fuses both scopes
+                # and exposes enough independent work to occupy Thor.
+                from sglang.kernels.ops.attention.nsa_triton_decode import (
+                    triton_fp8_attention_fwd,
+                )
+
+                o = triton_fp8_attention_fwd(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            elif _use_sm12x_flashmla_fallback:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )

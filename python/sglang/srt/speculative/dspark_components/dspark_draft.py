@@ -384,6 +384,10 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
+        # DecodeCudaGraphRunner chooses the DP graph tier from the unscaled
+        # per-rank request counts.  Target ForwardBatch construction preserves
+        # this field, but the synthetic DSpark draft batch must copy it here.
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
@@ -392,4 +396,12 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
+        # These ForwardBatch objects are assembled directly rather than through
+        # ForwardBatch.init_new(), so populate the scalar that the DP gathered
+        # CUDA-graph registry uses to distinguish real tokens from graph padding.
+        # The value is local to this DP rank (including zero for idle ranks).
+        forward_batch.num_token_non_padded = torch.tensor(
+            forward_batch.input_ids.numel(), dtype=torch.int32, device=device
+        )
+        forward_batch.num_token_non_padded_cpu = forward_batch.input_ids.numel()
         forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
