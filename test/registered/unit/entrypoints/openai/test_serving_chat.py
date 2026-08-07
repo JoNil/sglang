@@ -719,6 +719,51 @@ class ServingChatTestCase(unittest.TestCase):
                 self.assertEqual(request.stop, original_stop)
                 self.assertIsNone(result.tool_call_constraint)
 
+    def test_deepseek_v4_tool_calls_stop_at_native_envelope_end(self):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.tool_call_parser = "deepseekv4"
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tool_call_end = "</｜DSML｜tool_calls>"
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                },
+            },
+        }
+
+        for request_stop, expected in (
+            (None, [tool_call_end]),
+            ("USER_STOP", ["USER_STOP", tool_call_end]),
+            ([tool_call_end], [tool_call_end]),
+        ):
+            with (
+                self.subTest(request_stop=request_stop),
+                patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as parser_cls,
+            ):
+                parser = parser_cls.return_value
+                parser.detector.eot_token = tool_call_end
+                parser.detector.parses_required_natively.return_value = False
+                parser.get_structure_constraint.return_value = None
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Weather in Paris?"}],
+                    tools=[tool],
+                    tool_choice="auto",
+                    stop=request_stop,
+                )
+
+                result = self.chat._process_messages(request, is_multimodal=False)
+
+                self.assertEqual(result.stop, expected)
+
     def test_kimi_k3_tool_call_stop_is_scoped_to_active_tools(self):
         self.template_manager.chat_template_name = None
         self.template_manager.jinja_template_content_format = "string"

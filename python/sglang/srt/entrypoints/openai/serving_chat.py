@@ -1065,7 +1065,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     thinking_mode=xgrammar_reasoning,
                 )
                 required_parsed_natively = parser.detector.parses_required_natively()
-                if self.chat_encoding_spec == "kimi_k3":
+                # Native tool formats have a structural end marker before EOS.
+                # Treat it as a generation stop so a model that starts another
+                # tool envelope instead of emitting EOS cannot leave streaming
+                # clients waiting indefinitely before they execute the calls.
+                if (
+                    self.chat_encoding_spec == "kimi_k3"
+                    or self.tool_call_parser == "deepseekv4"
+                ):
                     tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None
