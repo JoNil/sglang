@@ -28,6 +28,9 @@ _THOR_DSV4_SPLITK_640 = int(
 )
 if _THOR_DSV4_SPLITK_640 not in (0, 1):
     raise ValueError("SGLANG_THOR_DSV4_SPLITK_640 must be 0 or 1")
+_THOR_DSV4_BLOCK_N16 = int(os.environ.get("SGLANG_THOR_DSV4_BLOCK_N16", "1"))
+if _THOR_DSV4_BLOCK_N16 not in (0, 1):
+    raise ValueError("SGLANG_THOR_DSV4_BLOCK_N16 must be 0 or 1")
 _IS_SM110: Optional[bool] = None
 
 
@@ -1301,7 +1304,12 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
 
 
 @triton.autotune(
-    configs=[
+    configs=(
+        [triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1)]
+        if _THOR_DSV4_BLOCK_N16
+        else []
+    )
+    + [
         # BLOCK_H=16 only (BLOCK_H >= 32 causes precision issues).
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 64}, num_warps=4, num_stages=1),
