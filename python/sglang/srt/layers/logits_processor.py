@@ -25,6 +25,7 @@ from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -727,7 +728,11 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if self.do_tensor_parallel_all_gather:
+        distributed_dspark_verify = (
+            envs.SGLANG_DSPARK_DISTRIBUTED_LOGITS.get()
+            and logits_metadata.forward_mode.is_target_verify()
+        )
+        if self.do_tensor_parallel_all_gather and not distributed_dspark_verify:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
             else:

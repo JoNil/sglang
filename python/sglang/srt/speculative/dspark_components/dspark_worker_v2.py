@@ -37,6 +37,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
+from sglang.srt.speculative.dspark_components.dspark_distributed_logits import (
+    gather_full_vocab,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -205,6 +208,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._verify_epilogue = DsparkVerifyEpilogue(
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
+                vocab_size=int(self.model_runner.model_config.vocab_size),
                 device=self.device,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
@@ -638,6 +642,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
             if grammar_mask is not None:
+                vocab_size = int(self.model_runner.model_config.vocab_size)
+                if logits_output.next_token_logits.shape[-1] != vocab_size:
+                    logits_output.next_token_logits = gather_full_vocab(
+                        logits_output.next_token_logits, vocab_size=vocab_size
+                    )
                 grammar_mask.apply(logits_output.next_token_logits)
 
         epilogue = self._verify_executor.verify_epilogue

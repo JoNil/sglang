@@ -21,6 +21,9 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.dspark_components.dspark_distributed_logits import (
+    sample_distributed_step_tokens,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -53,6 +56,9 @@ class DraftBlockResult(msgspec.Struct, frozen=True):
     corrected_logits: Optional[torch.Tensor]
     greedy_mask: torch.Tensor
     temperatures: torch.Tensor
+    distributed_logits: bool = False
+    vocab_start: int = 0
+    vocab_size: Optional[int] = None
 
 
 class DraftForwardResult(msgspec.Struct, frozen=True):
@@ -103,6 +109,10 @@ def sample_draft_block(
     greedy_mask = resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
     any_sampling = sampling_info is not None and not sampling_info.is_all_greedy
     fast_sampling = envs.SGLANG_DSPARK_FAST_SAMPLING.get()
+    distributed_logits = bool(getattr(markov_head, "_distributed_logits", False))
+    shard = getattr(markov_head, "_tp_shard", None)
+    vocab_start = int(shard.org_vocab_start) if distributed_logits else 0
+    vocab_size = int(markov_head.vocab_size)
 
     if sampling_info is None:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
@@ -115,15 +125,40 @@ def sample_draft_block(
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
+            if distributed_logits:
+                noise = torch.ones_like(step_logits, dtype=torch.float32)
+                return sample_distributed_step_tokens(
+                    step_logits=step_logits,
+                    temperatures=temperatures,
+                    greedy_mask=greedy_mask,
+                    exp_noise=noise,
+                    vocab_start=vocab_start,
+                )
             return torch.argmax(step_logits, dim=-1)
 
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
             expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
-            if fast_sampling:
-                exp_noise = torch.empty(
-                    step_logits.shape, dtype=torch.float32, device=step_logits.device
+            if fast_sampling or distributed_logits:
+                if distributed_logits:
+                    full_noise = torch.empty(
+                        (bs, vocab_size),
+                        dtype=torch.float32,
+                        device=step_logits.device,
+                    ).exponential_(1)
+                    exp_noise = full_noise[
+                        :, vocab_start : vocab_start + step_logits.shape[-1]
+                    ].contiguous()
+                    return sample_distributed_step_tokens(
+                        step_logits=step_logits,
+                        temperatures=temperatures,
+                        greedy_mask=greedy_mask,
+                        exp_noise=exp_noise,
+                        vocab_start=vocab_start,
+                    )
+                exp_noise = torch.empty_like(
+                    step_logits, dtype=torch.float32
                 ).exponential_(1)
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
@@ -151,6 +186,9 @@ def sample_draft_block(
         corrected_logits=corrected_logits,
         greedy_mask=greedy_mask,
         temperatures=temperatures,
+        distributed_logits=distributed_logits,
+        vocab_start=vocab_start,
+        vocab_size=vocab_size,
     )
 
 
@@ -248,6 +286,17 @@ class DraftBlockProposer:
                 corrected_logits=corrected_logits,
                 greedy_mask=greedy_mask,
                 temperatures=temperatures,
+                distributed_logits=bool(
+                    getattr(self.draft_model.markov_head, "_distributed_logits", False)
+                ),
+                vocab_start=int(
+                    getattr(
+                        getattr(self.draft_model.markov_head, "_tp_shard", None),
+                        "org_vocab_start",
+                        0,
+                    )
+                ),
+                vocab_size=int(self.draft_model.markov_head.vocab_size),
             )
             if draft_sampler.confidence_out is not None:
                 folded_confidence = draft_sampler.confidence_out[:bs]

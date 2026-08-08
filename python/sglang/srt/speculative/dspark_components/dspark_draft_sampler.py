@@ -9,6 +9,9 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     SampleStepTokens,
 )
 from sglang.srt.environ import DsparkFoldedSampling, envs
+from sglang.srt.speculative.dspark_components.dspark_distributed_logits import (
+    sample_distributed_step_tokens,
+)
 from sglang.srt.utils import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,10 @@ class DsparkDraftSampler:
     ):
         self.model = model
         self.markov_head = model.markov_head
+        self.distributed_logits = bool(
+            getattr(self.markov_head, "_distributed_logits", False)
+        )
+        self.tp_shard = getattr(self.markov_head, "_tp_shard", None)
         self.gamma = int(gamma)
         max_bs = int(max_bs)
         if out is not None:
@@ -68,8 +75,13 @@ class DsparkDraftSampler:
             self.exp_noise = torch.empty(
                 (max_bs, vocab), dtype=torch.float32, device=device
             )
+            corrected_vocab = (
+                int(self.tp_shard.num_embeddings_per_partition)
+                if self.distributed_logits
+                else vocab
+            )
             self.corrected_out = torch.empty(
-                (max_bs * self.gamma, vocab),
+                (max_bs * self.gamma, corrected_vocab),
                 dtype=model.lm_head.weight.dtype,
                 device=device,
             )
@@ -103,6 +115,18 @@ class DsparkDraftSampler:
                 # In-graph philox noise: each replay advances the generator
                 # and redraws.
                 noise = self.exp_noise[:bs].exponential_()
+                if self.distributed_logits:
+                    vocab_start = int(self.tp_shard.org_vocab_start)
+                    local_noise = noise[
+                        :, vocab_start : vocab_start + step_logits.shape[-1]
+                    ].contiguous()
+                    return sample_distributed_step_tokens(
+                        step_logits=step_logits,
+                        temperatures=self.temperatures[:bs],
+                        greedy_mask=self.greedy_mask[:bs],
+                        exp_noise=local_noise,
+                        vocab_start=vocab_start,
+                    )
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
                     temperatures=self.temperatures[:bs],
@@ -111,7 +135,25 @@ class DsparkDraftSampler:
                 )
 
         else:
-            sampler = greedy_step_sampler
+            if self.distributed_logits:
+
+                def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+                    del step_idx
+                    vocab_start = int(self.tp_shard.org_vocab_start)
+                    return sample_distributed_step_tokens(
+                        step_logits=step_logits,
+                        temperatures=torch.ones(
+                            (bs,), dtype=torch.float32, device=step_logits.device
+                        ),
+                        greedy_mask=torch.ones(
+                            (bs,), dtype=torch.bool, device=step_logits.device
+                        ),
+                        exp_noise=torch.ones_like(step_logits, dtype=torch.float32),
+                        vocab_start=vocab_start,
+                    )
+
+            else:
+                sampler = greedy_step_sampler
 
         draft_tokens, corrected_logits = self.markov_head.sample_block(
             base_logits,

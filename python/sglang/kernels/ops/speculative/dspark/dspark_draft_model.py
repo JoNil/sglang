@@ -71,6 +71,36 @@ class SampleStepTokens:
         )
 
 
+class SampleStepCandidates:
+    """Return the best local exponential-race key and token.
+
+    Unlike :class:`SampleStepTokens`, this leaves the final comparison to the
+    caller.  TP-sharded DSpark uses the result for a tiny cross-rank gather
+    instead of gathering the full vocabulary logits.
+    """
+
+    @classmethod
+    def execute(
+        cls,
+        *,
+        step_logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        greedy_mask: torch.Tensor,
+        exp_noise: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if step_logits.is_cuda:
+            return sample_step_candidates_triton(
+                step_logits=step_logits,
+                temperatures=temperatures,
+                greedy_mask=greedy_mask,
+                exp_noise=exp_noise,
+            )
+        scaled = step_logits.float() / temperatures.float().view(-1, 1)
+        sampled_score = scaled - torch.log(exp_noise.float().clamp_min(1e-30))
+        score = torch.where(greedy_mask.view(-1, 1), scaled, sampled_score)
+        return torch.max(score, dim=-1)
+
+
 def sample_step_tokens(
     *,
     step_logits: torch.Tensor,
@@ -198,6 +228,109 @@ def sample_step_tokens_triton(
         BLOCK_TILES=block_tiles,
     )
     return next_tokens
+
+
+@triton.jit
+def _candidate_partial_kernel(
+    logits_ptr,
+    temperatures_ptr,
+    greedy_mask_ptr,
+    exp_noise_ptr,
+    partial_score_ptr,
+    partial_idx_ptr,
+    V,
+    stride_row,
+    n_tiles,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask = offs < V
+    logits = tl.load(
+        logits_ptr + row * stride_row + offs, mask=mask, other=float("-inf")
+    ).to(tl.float32)
+    temperature = tl.load(temperatures_ptr + row)
+    greedy = tl.load(greedy_mask_ptr + row) != 0
+    noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
+    noise = tl.maximum(noise, 1.0e-30)
+    scaled = logits / temperature
+    score = tl.where(greedy, scaled, scaled - tl.log(noise))
+    score = tl.where(mask, score, float("-inf"))
+    best = tl.max(score, axis=0)
+    idx = tl.where(score == best, offs, _IDX_SENTINEL)
+    tl.store(partial_score_ptr + row * n_tiles + tile, best)
+    tl.store(partial_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
+
+
+@triton.jit
+def _candidate_combine_kernel(
+    partial_score_ptr,
+    partial_idx_ptr,
+    best_score_ptr,
+    best_idx_ptr,
+    n_tiles,
+    BLOCK_TILES: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_TILES)
+    mask = offs < n_tiles
+    scores = tl.load(
+        partial_score_ptr + row * n_tiles + offs,
+        mask=mask,
+        other=float("-inf"),
+    )
+    idxs = tl.load(
+        partial_idx_ptr + row * n_tiles + offs,
+        mask=mask,
+        other=_IDX_SENTINEL,
+    )
+    best = tl.max(scores, axis=0)
+    idx = tl.min(tl.where(scores == best, idxs, _IDX_SENTINEL), axis=0)
+    idx = tl.where(idx == _IDX_SENTINEL, 0, idx)
+    tl.store(best_score_ptr + row, best)
+    tl.store(best_idx_ptr + row, idx.to(tl.int64))
+
+
+def sample_step_candidates_triton(
+    *,
+    step_logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_mask: torch.Tensor,
+    exp_noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bs, vocab = step_logits.shape
+    device = step_logits.device
+    assert step_logits.stride(1) == 1, "step_logits rows must be contiguous"
+    temperatures = temperatures.to(torch.float32).contiguous()
+    greedy_mask = greedy_mask.to(torch.int32).contiguous()
+    exp_noise = exp_noise.to(torch.float32).contiguous()
+    n_tiles = triton.cdiv(vocab, _BLOCK_V)
+    partial_score = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
+    partial_idx = torch.empty((bs, n_tiles), dtype=torch.int32, device=device)
+    best_score = torch.empty((bs,), dtype=torch.float32, device=device)
+    best_idx = torch.empty((bs,), dtype=torch.int64, device=device)
+    _candidate_partial_kernel[(bs, n_tiles)](
+        step_logits,
+        temperatures,
+        greedy_mask,
+        exp_noise,
+        partial_score,
+        partial_idx,
+        vocab,
+        step_logits.stride(0),
+        n_tiles,
+        BLOCK_V=_BLOCK_V,
+    )
+    _candidate_combine_kernel[(bs,)](
+        partial_score,
+        partial_idx,
+        best_score,
+        best_idx,
+        n_tiles,
+        BLOCK_TILES=triton.next_power_of_2(n_tiles),
+    )
+    return best_score, best_idx
 
 
 _STACKED_WEIGHT_CACHE: dict[int, _StackedWkvWeight] = {}

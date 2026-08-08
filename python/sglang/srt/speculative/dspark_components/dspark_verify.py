@@ -23,14 +23,21 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided_into,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
+)
+from sglang.srt.speculative.dspark_components.dspark_distributed_logits import (
+    accept_greedy_distributed,
+    accept_sampling_distributed,
+    gather_full_vocab,
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     VerifyWindow,
@@ -250,6 +257,16 @@ class TargetVerifyExecutor:
             seq_lens_sum_backup=seq_lens_sum_backup,
         )
 
+        if (
+            envs.SGLANG_DSPARK_DISTRIBUTED_LOGITS.get()
+            and not verify_logits_adjustments_are_noop(sampling_info)
+        ):
+            logits = result.logits_output.next_token_logits
+            vocab_size = int(self.model_runner.model_config.vocab_size)
+            if logits.shape[-1] != vocab_size:
+                result.logits_output.next_token_logits = gather_full_vocab(
+                    logits, vocab_size=vocab_size
+                )
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
@@ -415,6 +432,15 @@ class TargetVerifyExecutor:
                 fill_value=0.0,
                 verify_num_draft_tokens=stride,
             )
+        if (
+            envs.SGLANG_DSPARK_DISTRIBUTED_LOGITS.get()
+            and not verify_logits_adjustments_are_noop(sampling_info)
+        ):
+            vocab_size = int(self.model_runner.model_config.vocab_size)
+            if strided_logits.shape[-1] != vocab_size:
+                strided_logits = gather_full_vocab(
+                    strided_logits, vocab_size=vocab_size
+                )
         apply_logits_adjustments_strided(
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
@@ -457,11 +483,13 @@ class DsparkVerifyEpilogue:
         *,
         max_bs: int,
         verify_num_draft_tokens: int,
+        vocab_size: int,
         device,
         commit_ctx: Optional[CommitInjectCtx] = None,
     ) -> None:
         self.max_bs = int(max_bs)
         self.stride = int(verify_num_draft_tokens)
+        self.vocab_size = int(vocab_size)
         self.gamma = self.stride - 1
         self.commit_ctx = commit_ctx
         self.inject_gate_buf = torch.zeros((1,), dtype=torch.int32, device=device)
@@ -602,12 +630,27 @@ class DsparkVerifyEpilogue:
             stride=self.stride,
             fill_value=0,
         )
-        correct_len, bonus, cap_trim_lens = accept_greedy_triton(
-            candidates=candidates.view(bs, self.stride),
-            target_logits=self.strided_logits[: bs * self.stride],
-            verify_num_draft_tokens=self.stride,
-            cutoff_verify_lens=verify_lens,
-        )
+        target_logits = self.strided_logits[: bs * self.stride]
+        if (
+            envs.SGLANG_DSPARK_DISTRIBUTED_LOGITS.get()
+            and target_logits.shape[-1] != self.vocab_size
+        ):
+            group = get_parallel().attn_tp_group
+            vocab_start = int(group.rank_in_group) * target_logits.shape[-1]
+            correct_len, bonus, cap_trim_lens = accept_greedy_distributed(
+                candidates=candidates.view(bs, self.stride),
+                target_local=target_logits,
+                vocab_start=vocab_start,
+                verify_num_draft_tokens=self.stride,
+                cutoff_verify_lens=verify_lens,
+            )
+        else:
+            correct_len, bonus, cap_trim_lens = accept_greedy_triton(
+                candidates=candidates.view(bs, self.stride),
+                target_logits=target_logits,
+                verify_num_draft_tokens=self.stride,
+                cutoff_verify_lens=verify_lens,
+            )
         finalized = finalize_accept_lens_triton(
             correct_len=correct_len,
             cap_trim_lens=cap_trim_lens,
@@ -669,6 +712,38 @@ def accept_draft_tokens(
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    draft_logits = draft_block.corrected_logits
+    if draft_block.distributed_logits:
+        vocab_size = int(draft_block.vocab_size)
+        if all_greedy and target_logits.shape[-1] != vocab_size:
+            return accept_greedy_distributed(
+                candidates=candidates,
+                target_local=target_logits,
+                vocab_start=draft_block.vocab_start,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                cutoff_verify_lens=cutoff_verify_lens,
+            )
+        untruncated = (
+            not all_greedy
+            and not sampling_info.need_top_k_sampling
+            and not sampling_info.need_top_p_sampling
+        )
+        if untruncated and target_logits.shape[-1] != vocab_size:
+            return accept_sampling_distributed(
+                candidates=candidates,
+                target_local=target_logits,
+                draft_local=draft_logits,
+                temperatures=draft_block.temperatures,
+                greedy_mask=draft_block.greedy_mask,
+                vocab_start=draft_block.vocab_start,
+                vocab_size=vocab_size,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                cutoff_verify_lens=cutoff_verify_lens,
+            )
+        if target_logits.shape[-1] != vocab_size:
+            target_logits = gather_full_vocab(target_logits, vocab_size=vocab_size)
+        if not all_greedy and draft_logits.shape[-1] != vocab_size:
+            draft_logits = gather_full_vocab(draft_logits, vocab_size=vocab_size)
     if all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,
@@ -676,9 +751,9 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
-    bs, gamma_rows, vocab = draft_block.corrected_logits.shape
+    bs, gamma_rows, vocab = draft_logits.shape
     draft_probs = SoftmaxTemp.execute(
-        logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
+        logits=draft_logits.reshape(bs * gamma_rows, vocab),
         temperatures=draft_block.temperatures,
         rows_per_request=gamma_rows,
     ).view(bs, gamma_rows, vocab)

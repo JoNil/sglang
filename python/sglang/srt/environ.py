@@ -339,6 +339,7 @@ class Envs:
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
+    SGLANG_DSPARK_DISTRIBUTED_LOGITS = EnvBool(False)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
     # Thor-only deployment experiment: retain the standalone WKV projection
     # for commit-time KV population, but use one packed WQ-A/WKV GEMM in each

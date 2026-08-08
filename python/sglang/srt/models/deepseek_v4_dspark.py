@@ -349,6 +349,12 @@ class DSparkV4MarkovHead(nn.Module):
         )
         self._opt_markov_w2_bf16 = envs.SGLANG_DSPARK_OPT_MARKOV_W2_BF16.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        self._distributed_logits = envs.SGLANG_DSPARK_DISTRIBUTED_LOGITS.get()
+        if self._distributed_logits and not self._opt_markov_w2_tp_shard:
+            raise ValueError(
+                "SGLANG_DSPARK_DISTRIBUTED_LOGITS requires "
+                "SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD=1."
+            )
         markov_w2_dtype = torch.bfloat16 if self._opt_markov_w2_bf16 else torch.float32
         self.markov_w2 = nn.Linear(
             self.markov_rank, self.vocab_size, bias=False, dtype=markov_w2_dtype
@@ -434,6 +440,8 @@ class DSparkV4MarkovHead(nn.Module):
         else:
             bias = F.linear(latent.float(), weight_local)
         step_local = BuildStepLocal.execute(bias=bias, base_local=base_local)
+        if self._distributed_logits:
+            return step_local
         if shard.tp_size > 1:
             full = get_parallel().attn_tp_group.all_gather(step_local, dim=-1)
         else:
