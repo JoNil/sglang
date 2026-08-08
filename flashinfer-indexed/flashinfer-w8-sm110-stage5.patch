@@ -1,0 +1,13 @@
+--- a/flashinfer/gemm/gemm_groupwise_sm100.cuh
++++ b/flashinfer/gemm/gemm_groupwise_sm100.cuh
+@@ -222,9 +222,7 @@
+       /*GemmLayoutA=*/cute::tuple<LayoutA, LayoutSFA>, AlignmentA, ElementB,
+       /*GemmLayoutB=*/cute::tuple<LayoutB, LayoutSFB>, AlignmentB, ElementAccumulator,
+       /*TileShapeMNK=*/MmaTileShape_MNK, ClusterShape_MNK,
+-      /*StageCountType=*/
+-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
++      /*StageCountType=*/cutlass::gemm::collective::StageCount<5>,
+       /*KernelScheduleType=*/cutlass::gemm::KernelTmaWarpSpecializedBlockwise1SmSm100>::
+       CollectiveOp;
+ 

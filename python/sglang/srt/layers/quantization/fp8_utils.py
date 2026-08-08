@@ -328,6 +328,11 @@ if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
 
+    from sglang.srt.layers.quantization.flashinfer_sm110_w8 import (
+        thor_stage5_gemm_fp8_nt_groupwise,
+        use_thor_stage5_w8,
+    )
+
     from sglang.srt.utils.custom_op import register_custom_op
 
     @register_custom_op(
@@ -391,6 +396,14 @@ if is_blackwell_supported() and is_flashinfer_available():
             # FlashInfer CUTLASS groupwise kernel requires contiguous scale tensors
             x_scale = x_scale.contiguous()
             weight_scale = weight_scale.contiguous()
+            if use_thor_stage5_w8():
+                return thor_stage5_gemm_fp8_nt_groupwise(
+                    q_input,
+                    weight,
+                    x_scale,
+                    weight_scale,
+                    out_dtype,
+                )
             return _raw_gemm_fp8_nt_groupwise(
                 q_input,
                 weight,
