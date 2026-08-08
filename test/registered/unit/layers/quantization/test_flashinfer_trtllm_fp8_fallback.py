@@ -98,6 +98,40 @@ class TestFlashinferTrtllmFp8Fallback(CustomTestCase):
         triton_spy.assert_called_once()
         trtllm_spy.assert_not_called()
 
+    def test_cutlass_large_m_falls_back_before_quantization(self):
+        """Thor's native CUTLASS path is decode-only until its eager-prefill
+        schedule supports every DSV4 projection shape."""
+        input_2d = torch.zeros((128, 1024), dtype=torch.bfloat16)
+        weight = torch.zeros((N, 1024), dtype=torch.float32)
+        weight_scale = torch.zeros((8, 4), dtype=torch.float32)
+        weight_scale.flashinfer_scale_major_mode = "MN"
+        triton_spy = MagicMock(
+            return_value=torch.zeros((input_2d.shape[0], N), dtype=torch.bfloat16)
+        )
+        cutlass_spy = MagicMock()
+        quant_spy = MagicMock()
+
+        with patch.object(
+            fp8_utils,
+            "_get_flashinfer_groupwise_backend",
+            return_value="cutlass",
+            create=True,
+        ), patch.object(
+            fp8_utils, "gemm_fp8_nt_groupwise", cutlass_spy, create=True
+        ), patch.object(
+            fp8_utils, "triton_w8a8_block_fp8_linear", triton_spy
+        ), patch.object(
+            fp8_utils, "sglang_per_token_group_quant_fp8", quant_spy
+        ):
+            fp8_utils.flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
+                input_2d, weight, BLOCK_SIZE, weight_scale
+            )
+
+        triton_spy.assert_called_once()
+        self.assertEqual(tuple(triton_spy.call_args.args[3].shape), (4, 8))
+        cutlass_spy.assert_not_called()
+        quant_spy.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=3)

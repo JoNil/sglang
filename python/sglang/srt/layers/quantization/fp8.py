@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     dispatch_w8a8_block_fp8_linear,
     dispatch_w8a8_mxfp8_linear,
+    flashinfer_cutlass_w8a8_shape_supported,
     get_fp8_gemm_runner_backend,
     input_to_float8,
     mxfp8_group_quantize,
@@ -718,6 +719,21 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
+        # FlashInfer CUTLASS consumes MN-major block scales as
+        # (K // block_k, N // block_n). Prepare this once after loading rather
+        # than transposing and allocating the same scale tensor for every GEMM.
+        # SM110 auto-dispatch also selects this native CUTLASS path.
+        fp8_backend = get_fp8_gemm_runner_backend()
+        if fp8_backend.is_flashinfer_cutlass() or (
+            fp8_backend.is_auto() and is_sm110_supported()
+        ):
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_cutlass",
+                layer.weight_scale_inv.data.transpose(-1, -2).contiguous(),
+            )
+            layer.weight_scale_inv_cutlass.flashinfer_scale_major_mode = "MN"
+
         if (
             _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
@@ -1019,12 +1035,24 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            fp8_backend = get_fp8_gemm_runner_backend()
+            use_flashinfer_cutlass = fp8_backend.is_flashinfer_cutlass() or (
+                fp8_backend.is_auto() and is_sm110_supported()
+            )
+            input_tensor = x[0] if isinstance(x, tuple) else x
+            if use_flashinfer_cutlass and flashinfer_cutlass_w8a8_shape_supported(
+                input_tensor, layer.weight
+            ):
+                weight_scale = layer.weight_scale_inv_cutlass
+            else:
+                weight_scale = layer.weight_scale_inv
+
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
                     block_size=self.weight_block_size,
-                    weight_scale=layer.weight_scale_inv,
+                    weight_scale=weight_scale,
                     input_scale=x[1],
                     bias=bias,
                 )
@@ -1033,7 +1061,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
+                weight_scale=weight_scale,
                 input_scale=None,
                 bias=bias,
             )

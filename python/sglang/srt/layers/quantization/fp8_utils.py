@@ -311,6 +311,16 @@ class Fp8GemmRunnerBackend(Enum):
 FP8_GEMM_RUNNER_BACKEND: Fp8GemmRunnerBackend | None = None
 
 
+def flashinfer_cutlass_w8a8_shape_supported(
+    input: torch.Tensor, weight: torch.Tensor
+) -> bool:
+    """Return whether Thor's measured native CUTLASS decode route should run."""
+    m = input.view(-1, input.shape[-1]).shape[0]
+    return m <= 16 and not (
+        m >= 6 and tuple(weight.shape) in ((32768, 1024), (512, 4096))
+    )
+
+
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
@@ -352,9 +362,11 @@ if is_blackwell_supported() and is_flashinfer_available():
             return "trtllm"
 
         major, minor = get_device_capability()
-        # SM120/121: CUTLASS only.
+        # SM120/121 and SM110: CUTLASS only.
         # SM100/103: TRTLLM only.
         if major >= 12:
+            return "cutlass"
+        if major == 11:
             return "cutlass"
         return "trtllm"
 
@@ -674,21 +686,45 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     backend = _get_flashinfer_groupwise_backend()
+
+    def triton_fallback() -> torch.Tensor:
+        fallback_weight_scale = weight_scale
+        if getattr(weight_scale, "flashinfer_scale_major_mode", None) == "MN":
+            fallback_weight_scale = weight_scale.transpose(-1, -2).contiguous()
+        return triton_w8a8_block_fp8_linear(
+            input,
+            weight,
+            block_size,
+            fallback_weight_scale,
+            input_scale,
+            bias,
+        )
+
     # Fall back to triton for non-supported formats.
     # TODO: Check if flashinfer supports other output dtypes besides bf16.
     if backend == "trtllm" and (
         input_2d.shape[1] < 256 or input_2d.dtype != torch.bfloat16
     ):
-        return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
-        )
+        return triton_fallback()
+    # The generic SM100-family CUTLASS schedule is validated for Thor's decode
+    # and speculative-verify batches (up to two requests x seven tokens).  Its
+    # can_implement() rejects at least one real DSV4 eager-prefill projection,
+    # so retain the proven Triton path for larger M until a dedicated prefill
+    # schedule is selected.  This also avoids eager custom-op overhead in TTFT.
+    if backend == "cutlass" and not flashinfer_cutlass_w8a8_shape_supported(
+        input_2d, weight
+    ):
+        return triton_fallback()
 
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    # TRTLLM uses the existing SGLang column-major scale layout.
-    # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
+    # Both FlashInfer backends benefit from writing scales in column-major order.
+    # For CUTLASS, transposing that view produces the required contiguous
+    # (k//block_k, m) MN-major tensor without a copy.
     q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d, block_size[1], column_major_scales=(backend == "trtllm")
+        input_2d,
+        block_size[1],
+        column_major_scales=(backend in ("trtllm", "cutlass")),
     )
     if backend == "cutlass":
         block_n, block_k = block_size
@@ -697,8 +733,17 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         expected_x_scale_shape = (k // block_k, m)
         expected_weight_scale_shape = (k // block_k, n // block_n)
         if x_scale.shape == (m, k // block_k):
-            x_scale = x_scale.transpose(-1, -2).contiguous()
-        if weight_scale.shape == (n // block_n, k // block_k):
+            x_scale = x_scale.transpose(-1, -2)
+        # Square scale grids have identical canonical and MN-major shapes, so
+        # shape inspection alone cannot identify a prepacked tensor.  The model
+        # loader marks its one-time transpose explicitly.
+        weight_scale_is_mn = getattr(
+            weight_scale, "flashinfer_scale_major_mode", None
+        ) == "MN"
+        if not weight_scale_is_mn and weight_scale.shape == (
+            n // block_n,
+            k // block_k,
+        ):
             weight_scale = weight_scale.transpose(-1, -2).contiguous()
         assert x_scale.shape == expected_x_scale_shape, (
             "FlashInfer CUTLASS groupwise FP8 expects A scale layout "

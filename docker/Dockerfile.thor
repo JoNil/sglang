@@ -26,6 +26,16 @@ COPY flashinfer-indexed/group_gemm_mxfp4_groupwise_sm100.cu \
     flashinfer-indexed/group_gemm_mxfp4_indexed_thor_binding.cu \
     /usr/local/lib/python3.12/dist-packages/flashinfer/data/csrc/
 
+# FlashInfer 0.6.15 ships the SM100-family blockwise FP8 CUTLASS source and
+# already generates sm_110a code, but its Python capability gates omit Thor.
+# Enable the source-JIT path without changing the checkpoint's FP8 values or
+# FP32 128x128 scales.
+COPY flashinfer-indexed/flashinfer-gemm-sm110.patch /tmp/flashinfer-gemm-sm110.patch
+RUN patch --batch --forward -p1 \
+      -d /usr/local/lib/python3.12/dist-packages/flashinfer/gemm \
+      < /tmp/flashinfer-gemm-sm110.patch && \
+    rm /tmp/flashinfer-gemm-sm110.patch
+
 ENV PYTHONPATH=/opt/sglang-thor/python \
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
     SGLANG_THOR_CUDA_GRAPH_MAX_BS=2
