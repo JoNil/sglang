@@ -18,7 +18,7 @@ _COUNT_BLOCK_T = 256
 _SORT_BLOCK_T = 256
 _QUANT_BLOCK = 32
 _QUANT_GROUPS_PER_PROGRAM = int(
-    os.environ.get("SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM", "8")
+    os.environ.get("SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM", "16")
 )
 if _QUANT_GROUPS_PER_PROGRAM not in (1, 2, 4, 8, 16):
     raise ValueError(
