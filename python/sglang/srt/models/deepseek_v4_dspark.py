@@ -78,6 +78,54 @@ def apply_rotary_emb(
     return y
 
 
+class _PackedWkvLinear:
+    """Expose the KV rows of a packed WQKV linear without owning parameters."""
+
+    def __init__(self, packed: nn.Module, q_rows: int) -> None:
+        self._packed = packed
+        self._q_rows = q_rows
+        self.input_size = packed.input_size
+        self.output_size = packed.output_size - q_rows
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self._packed.weight[self._q_rows :]
+
+    @property
+    def weight_scale_inv(self) -> torch.Tensor:
+        scale = self._packed.weight_scale_inv
+        total_rows = self._packed.weight.shape[0]
+        scale_rows = scale.shape[0]
+        if scale_rows == total_rows:
+            # DeepGEMM's post-load packed UE8M0 layout has one scale row per
+            # output row, even though the logical scale is per 128 rows.
+            offset = self._q_rows
+        else:
+            if total_rows % scale_rows != 0:
+                raise ValueError(
+                    f"cannot slice packed WKV scale with {total_rows=} {scale_rows=}"
+                )
+            rows_per_scale = total_rows // scale_rows
+            if self._q_rows % rows_per_scale != 0:
+                raise ValueError(
+                    f"packed WQ rows do not align to scale blocks: "
+                    f"{self._q_rows=} {rows_per_scale=}"
+                )
+            offset = self._q_rows // rows_per_scale
+        return scale[offset:]
+
+    @property
+    def quant_method(self):
+        return self._packed.quant_method
+
+    def __getattr__(self, name: str):
+        return getattr(self._packed, name)
+
+    def __call__(self, x: torch.Tensor):
+        output = self.quant_method.apply(self, x, bias=None)
+        return output, None
+
+
 class DSparkAttention(MqaAttentionBase):
 
     def __init__(
@@ -88,6 +136,7 @@ class DSparkAttention(MqaAttentionBase):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
     ) -> None:
+        thor_fuse_wqkv = envs.SGLANG_THOR_DSPARK_FUSE_WQKV.get()
         super().__init__(
             config,
             layer_id,
@@ -96,21 +145,18 @@ class DSparkAttention(MqaAttentionBase):
             attn_tp_rank=get_parallel().attn_tp_rank,
             attn_tp_size=get_parallel().attn_tp_size,
             compress_ratio=0,
-            fuse_wqa_wkv=False,
+            fuse_wqa_wkv=thor_fuse_wqkv,
             wo_a_fp8=False,
             wo_a_keeps_quant_config=False,
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        self._thor_fuse_wqkv = envs.SGLANG_THOR_DSPARK_FUSE_WQKV.get()
+        self._thor_fuse_wqkv = thor_fuse_wqkv
         if self._thor_fuse_wqkv:
-            self.wqkv_a = ReplicatedLinear(
-                self.hidden_size,
-                self.q_lora_rank + self.head_dim,
-                bias=False,
-                quant_config=quant_config,
-                prefix=add_prefix("wqkv_a", prefix),
-            )
+            # MqaAttentionBase created only the packed runtime projection. Keep a
+            # zero-copy view for CommitKvProj instead of retaining standalone
+            # WQ-A/WKV-A parameters alongside the packed weight.
+            self.wkv = _PackedWkvLinear(self.wqkv_a, self.q_lora_rank)
         assert (
             self.compress_ratio == 0
         ), "DSpark draft attention requires compress_ratio == 0."
@@ -135,23 +181,6 @@ class DSparkAttention(MqaAttentionBase):
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
         return kv
-
-    def populate_runtime_wqkv(self) -> None:
-        """Pack loaded draft Q-A/KV-A tensors into the runtime-only linear."""
-        if not self._thor_fuse_wqkv:
-            return
-        q_rows = self.q_lora_rank
-        with torch.no_grad():
-            self.wqkv_a.weight[:q_rows].copy_(self.wq_a.weight)
-            self.wqkv_a.weight[q_rows:].copy_(self.wkv.weight)
-            if hasattr(self.wqkv_a, "weight_scale_inv"):
-                q_scale_rows = self.wq_a.weight_scale_inv.shape[0]
-                self.wqkv_a.weight_scale_inv[:q_scale_rows].copy_(
-                    self.wq_a.weight_scale_inv
-                )
-                self.wqkv_a.weight_scale_inv[q_scale_rows:].copy_(
-                    self.wkv.weight_scale_inv
-                )
 
     def _store_block_kv(
         self,
@@ -834,6 +863,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        packed_wqkv_shards: dict[str, set[str]] = {}
+        fuse_wqkv = all(stage.self_attn._thor_fuse_wqkv for stage in self.stages)
 
         weights = _dequant_fp8_wo_a_streaming(weights)
 
@@ -850,6 +881,45 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_weight_name(name)
             if mapped is None:
+                continue
+
+            if fuse_wqkv and (
+                ".self_attn.wq_a." in mapped or ".self_attn.wkv." in mapped
+            ):
+                is_q = ".self_attn.wq_a." in mapped
+                shard = "q" if is_q else "kv"
+                packed_name = mapped.replace(
+                    ".self_attn.wq_a." if is_q else ".self_attn.wkv.",
+                    ".self_attn.wqkv_a.",
+                )
+                param = params_dict[packed_name]
+                if param.ndim == 0 or loaded_weight.ndim == 0:
+                    raise ValueError(
+                        f"packed WQKV shard must have an output dimension: "
+                        f"{packed_name=} {param.shape=} {loaded_weight.shape=}"
+                    )
+                if tuple(param.shape[1:]) != tuple(loaded_weight.shape[1:]):
+                    raise ValueError(
+                        f"packed WQKV shard trailing shape mismatch: "
+                        f"{packed_name=} {param.shape=} {loaded_weight.shape=}"
+                    )
+                offset = 0 if is_q else param.shape[0] - loaded_weight.shape[0]
+                if offset < 0 or offset + loaded_weight.shape[0] > param.shape[0]:
+                    raise ValueError(
+                        f"packed WQKV shard does not fit: {packed_name=} {shard=} "
+                        f"{param.shape=} {loaded_weight.shape=}"
+                    )
+                with torch.no_grad():
+                    param.data.narrow(0, offset, loaded_weight.shape[0]).copy_(
+                        loaded_weight
+                    )
+                shards = packed_wqkv_shards.setdefault(packed_name, set())
+                if shard in shards:
+                    raise ValueError(
+                        f"duplicate packed WQKV {shard} shard for {packed_name}"
+                    )
+                shards.add(shard)
+                loaded_params.add(packed_name)
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -902,8 +972,15 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
-        for stage in self.stages:
-            stage.self_attn.populate_runtime_wqkv()
+        incomplete_packed = {
+            name: shards
+            for name, shards in packed_wqkv_shards.items()
+            if shards != {"q", "kv"}
+        }
+        if incomplete_packed:
+            raise ValueError(
+                f"incomplete packed WQKV checkpoint shards: {incomplete_packed}"
+            )
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
