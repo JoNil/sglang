@@ -17,6 +17,18 @@ if _ROUTE_BLOCK not in (1, 2, 4):
 _COUNT_BLOCK_T = 256
 _SORT_BLOCK_T = 256
 _QUANT_BLOCK = 32
+_QUANT_GROUPS_PER_PROGRAM = int(
+    os.environ.get("SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM", "8")
+)
+if _QUANT_GROUPS_PER_PROGRAM not in (1, 2, 4, 8, 16):
+    raise ValueError(
+        "SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM must be 1, 2, 4, 8, or 16"
+    )
+_QUANT_VECTOR_MIN_TOKENS = int(
+    os.environ.get("SGLANG_THOR_MXFP8_VECTOR_MIN_TOKENS", "8")
+)
+if _QUANT_VECTOR_MIN_TOKENS < 1:
+    raise ValueError("SGLANG_THOR_MXFP8_VECTOR_MIN_TOKENS must be positive")
 _EAGER_WORKSPACES: dict[tuple, "NativeMxfp4Workspace"] = {}
 
 
@@ -37,6 +49,13 @@ def max_packed_rows(num_routes: int, num_experts: int) -> int:
 
 def max_active_groups(num_routes: int, num_experts: int) -> int:
     return max(1, min(int(num_routes), int(num_experts)))
+
+
+def quant_groups_per_program(num_tokens: int) -> int:
+    """Keep latency-optimal scalar groups for batch-one decode."""
+    if int(num_tokens) < _QUANT_VECTOR_MIN_TOKENS:
+        return 1
+    return _QUANT_GROUPS_PER_PROGRAM
 
 
 @triton.jit
@@ -309,10 +328,15 @@ def _route_quantize_kernel(
     MAX_PACKED_ROWS: tl.constexpr,
     ROUTE_BLOCK: tl.constexpr,
     SCALE_COLS: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
 ):
     packed_row = tl.program_id(0)
-    scale_col = tl.program_id(1)
-    columns = scale_col * 32 + tl.arange(0, 32)
+    scale_cols = (
+        tl.program_id(1) * GROUPS_PER_PROGRAM
+        + tl.arange(0, GROUPS_PER_PROGRAM)
+    )
+    columns = scale_cols[:, None] * 32 + tl.arange(0, 32)[None, :]
+    active_cols = scale_cols < HIDDEN // 32
     active_row = packed_row < tl.load(packed_route_count)
     route = tl.load(
         packed_route_indices + packed_row,
@@ -323,19 +347,19 @@ def _route_quantize_kernel(
     token = route // TOP_K
     values = tl.load(
         source + token * HIDDEN + columns,
-        mask=active,
+        mask=active & active_cols[:, None],
         other=0.0,
     ).to(tl.float32)
-    maximum = tl.max(tl.abs(values), axis=0)
+    maximum = tl.max(tl.abs(values), axis=1)
     safe_maximum = tl.maximum(maximum, 2.0**-126)
     exponent = tl.ceil(tl.log2(safe_maximum / 448.0))
     exponent = tl.maximum(-127.0, tl.minimum(127.0, exponent))
     scale = tl.exp2(exponent)
-    quantized = values / scale
+    quantized = values / scale[:, None]
     tl.store(
         output + packed_row * HIDDEN + columns,
         quantized,
-        mask=active_row,
+        mask=active_row & active_cols[:, None],
     )
 
     expert = tl.load(
@@ -351,9 +375,9 @@ def _route_quantize_kernel(
         packed_row,
         expert,
         expert_row,
-        scale_col,
+        scale_cols,
         expert_start,
-        active_row,
+        active_row & active_cols,
         SCALE_COLS,
     )
 
@@ -371,34 +395,39 @@ def _swiglu_quantize_kernel(
     MAX_PACKED_ROWS: tl.constexpr,
     ROUTE_BLOCK: tl.constexpr,
     SCALE_COLS: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
 ):
     packed_row = tl.program_id(0)
-    scale_col = tl.program_id(1)
-    columns = scale_col * 32 + tl.arange(0, 32)
+    scale_cols = (
+        tl.program_id(1) * GROUPS_PER_PROGRAM
+        + tl.arange(0, GROUPS_PER_PROGRAM)
+    )
+    columns = scale_cols[:, None] * 32 + tl.arange(0, 32)[None, :]
+    active_cols = scale_cols < INTERMEDIATE // 32
     active_row = packed_row < tl.load(packed_route_count)
 
     # The checkpoint loader stores the fused projection as [up; gate].
     up = tl.load(
         fc1 + packed_row * FC1_COLS + columns,
-        mask=active_row,
+        mask=active_row & active_cols[:, None],
         other=0.0,
     ).to(tl.float32)
     gate = tl.load(
         fc1 + packed_row * FC1_COLS + INTERMEDIATE + columns,
-        mask=active_row,
+        mask=active_row & active_cols[:, None],
         other=0.0,
     ).to(tl.float32)
     activated = (gate * tl.sigmoid(gate)) * up
-    maximum = tl.max(tl.abs(activated), axis=0)
+    maximum = tl.max(tl.abs(activated), axis=1)
     safe_maximum = tl.maximum(maximum, 2.0**-126)
     exponent = tl.ceil(tl.log2(safe_maximum / 448.0))
     exponent = tl.maximum(-127.0, tl.minimum(127.0, exponent))
     scale = tl.exp2(exponent)
-    quantized = activated / scale
+    quantized = activated / scale[:, None]
     tl.store(
         output + packed_row * INTERMEDIATE + columns,
         quantized,
-        mask=active_row,
+        mask=active_row & active_cols[:, None],
     )
 
     expert = tl.load(
@@ -414,9 +443,9 @@ def _swiglu_quantize_kernel(
         packed_row,
         expert,
         expert_row,
-        scale_col,
+        scale_cols,
         expert_start,
-        active_row,
+        active_row & active_cols,
         SCALE_COLS,
     )
 
@@ -801,8 +830,15 @@ def native_mxfp4_moe(
     )
 
     input_sf_cols = _align_up(hidden // _QUANT_BLOCK, 4)
+    quant_groups = quant_groups_per_program(num_tokens)
+    quant_warps = 4 if quant_groups >= 4 else 1
     _route_quantize_kernel[
-        (active_max_rows, hidden // _QUANT_BLOCK)
+        (
+            active_max_rows,
+            triton.cdiv(
+                hidden // _QUANT_BLOCK, quant_groups
+            ),
+        )
     ](
         x,
         workspace.packed_route_indices,
@@ -817,7 +853,8 @@ def native_mxfp4_moe(
         MAX_PACKED_ROWS=active_max_rows,
         ROUTE_BLOCK=_ROUTE_BLOCK,
         SCALE_COLS=input_sf_cols,
-        num_warps=1,
+        GROUPS_PER_PROGRAM=quant_groups,
+        num_warps=quant_warps,
     )
 
     _indexed_group_gemm(
@@ -835,7 +872,13 @@ def native_mxfp4_moe(
 
     act_sf_cols = _align_up(workspace.intermediate // _QUANT_BLOCK, 4)
     _swiglu_quantize_kernel[
-        (active_max_rows, workspace.intermediate // _QUANT_BLOCK)
+        (
+            active_max_rows,
+            triton.cdiv(
+                workspace.intermediate // _QUANT_BLOCK,
+                quant_groups,
+            ),
+        )
     ](
         workspace.fc1,
         workspace.block_expert_ids,
@@ -848,7 +891,8 @@ def native_mxfp4_moe(
         MAX_PACKED_ROWS=active_max_rows,
         ROUTE_BLOCK=_ROUTE_BLOCK,
         SCALE_COLS=act_sf_cols,
-        num_warps=1,
+        GROUPS_PER_PROGRAM=quant_groups,
+        num_warps=quant_warps,
     )
 
     _indexed_group_gemm(
