@@ -102,6 +102,15 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
+        self._thor_fuse_wqkv = envs.SGLANG_THOR_DSPARK_FUSE_WQKV.get()
+        if self._thor_fuse_wqkv:
+            self.wqkv_a = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank + self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wqkv_a", prefix),
+            )
         assert (
             self.compress_ratio == 0
         ), "DSpark draft attention requires compress_ratio == 0."
@@ -126,6 +135,23 @@ class DSparkAttention(MqaAttentionBase):
     def kv_proj_only(self, x: torch.Tensor) -> torch.Tensor:
         kv, _ = self.wkv(x)
         return kv
+
+    def populate_runtime_wqkv(self) -> None:
+        """Pack loaded draft Q-A/KV-A tensors into the runtime-only linear."""
+        if not self._thor_fuse_wqkv:
+            return
+        q_rows = self.q_lora_rank
+        with torch.no_grad():
+            self.wqkv_a.weight[:q_rows].copy_(self.wq_a.weight)
+            self.wqkv_a.weight[q_rows:].copy_(self.wkv.weight)
+            if hasattr(self.wqkv_a, "weight_scale_inv"):
+                q_scale_rows = self.wq_a.weight_scale_inv.shape[0]
+                self.wqkv_a.weight_scale_inv[:q_scale_rows].copy_(
+                    self.wq_a.weight_scale_inv
+                )
+                self.wqkv_a.weight_scale_inv[q_scale_rows:].copy_(
+                    self.wkv.weight_scale_inv
+                )
 
     def _store_block_kv(
         self,
@@ -153,6 +179,14 @@ class DSparkAttention(MqaAttentionBase):
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_a(x)
+        return self._compute_q_from_lora(q, positions, q_out=q_out)
+
+    def _compute_q_from_lora(
+        self,
+        q: torch.Tensor,
+        positions: torch.Tensor,
+        q_out: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
@@ -197,12 +231,22 @@ class DSparkAttention(MqaAttentionBase):
             )
             q_out = q_padded[:, : self.n_local_heads, :]
 
+        if self._thor_fuse_wqkv:
+            qkv, _ = self.wqkv_a(hidden_states)
+            q_lora = qkv[..., : self.q_lora_rank]
+            kv = qkv[..., self.q_lora_rank :]
+
         if enable_multi_stream:
             current_stream = torch.cuda.current_stream()
             stream_kv = self.alt_streams[0]
-            stream_kv.wait_stream(current_stream)
+            if self._thor_fuse_wqkv:
+                qkv_ready = current_stream.record_event()
+                stream_kv.wait_event(qkv_ready)
+            else:
+                stream_kv.wait_stream(current_stream)
             with torch.cuda.stream(stream_kv):
-                kv = self.kv_proj_only(hidden_states)
+                if not self._thor_fuse_wqkv:
+                    kv = self.kv_proj_only(hidden_states)
                 self._store_block_kv(
                     kv=kv,
                     positions=positions,
@@ -210,10 +254,15 @@ class DSparkAttention(MqaAttentionBase):
                     attn_backend=attn_backend,
                     pool=pool,
                 )
-            q = self._compute_q(hidden_states, positions, q_out=q_out)
+            q = (
+                self._compute_q_from_lora(q_lora, positions, q_out=q_out)
+                if self._thor_fuse_wqkv
+                else self._compute_q(hidden_states, positions, q_out=q_out)
+            )
             current_stream.wait_stream(stream_kv)
         else:
-            kv = self.kv_proj_only(hidden_states)
+            if not self._thor_fuse_wqkv:
+                kv = self.kv_proj_only(hidden_states)
             self._store_block_kv(
                 kv=kv,
                 positions=positions,
@@ -221,7 +270,11 @@ class DSparkAttention(MqaAttentionBase):
                 attn_backend=attn_backend,
                 pool=pool,
             )
-            q = self._compute_q(hidden_states, positions, q_out=q_out)
+            q = (
+                self._compute_q_from_lora(q_lora, positions, q_out=q_out)
+                if self._thor_fuse_wqkv
+                else self._compute_q(hidden_states, positions, q_out=q_out)
+            )
 
         if q_padded is not None:
             q = q_padded
@@ -841,6 +894,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+        for stage in self.stages:
+            stage.self_attn.populate_runtime_wqkv()
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set

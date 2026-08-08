@@ -340,6 +340,10 @@ class Envs:
     SGLANG_DSPARK_OPT_MARKOV_W2_BF16 = EnvBool(True)
     SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD = EnvBool(True)
     SGLANG_DSPARK_ENABLE_MULTI_STREAM = EnvBool(True)
+    # Thor-only deployment experiment: retain the standalone WKV projection
+    # for commit-time KV population, but use one packed WQ-A/WKV GEMM in each
+    # draft stage forward. Disabled by default for portable checkpoint loading.
+    SGLANG_THOR_DSPARK_FUSE_WQKV = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
