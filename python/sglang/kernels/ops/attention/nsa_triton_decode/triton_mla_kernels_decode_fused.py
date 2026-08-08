@@ -11,6 +11,7 @@ Supports:
 - All configs: with/without topk_length, with/without attn_sink
 """
 
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -22,6 +23,22 @@ from sglang.srt.utils.common import is_gfx942_supported
 # gfx942/MI300/MI325 stores e4m3fnuz (bias 8);
 # gfx950/MI350 and CUDA store OCP e4m3fn (bias 7).
 _KV_FP8_TY = tl.float8e4b8 if is_gfx942_supported() else tl.float8e4nv
+_THOR_DSV4_SPLITK_640 = int(
+    os.environ.get("SGLANG_THOR_DSV4_SPLITK_640", "1")
+)
+if _THOR_DSV4_SPLITK_640 not in (0, 1):
+    raise ValueError("SGLANG_THOR_DSV4_SPLITK_640 must be 0 or 1")
+_IS_SM110: Optional[bool] = None
+
+
+def _is_sm110() -> bool:
+    global _IS_SM110
+    if _IS_SM110 is None:
+        _IS_SM110 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (
+            11,
+            0,
+        )
+    return _IS_SM110
 
 
 def _bucket_total_tokens(total_tokens: int) -> int:
@@ -74,6 +91,22 @@ def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> i
     Returns:
         split_k value (0 means no split-K, use non-splitk kernel).
     """
+    # DSV4 target and DSPARK batch-one verification use 7 and 6 tokens,
+    # respectively. With 64 heads and 128 SWA + 512 C4 entries, the generic
+    # selector leaves only 12-14 CTAs on Thor's 20 SMs. Exact-shape SM110
+    # sweeps favor two splits for M=7 and four for M=6. Batch-two M=12/14 and
+    # single-token decode remain faster without splitting.
+    if (
+        _THOR_DSV4_SPLITK_640
+        and h_q == 64
+        and total_topk == 640
+        and _is_sm110()
+    ):
+        if total_tokens == 6:
+            return 4
+        if total_tokens == 7:
+            return 2
+
     # Conditions under which split-K is beneficial:
     use_splitk_for_small_bs = total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD and (
         h_q >= 128 or total_topk >= 1024
