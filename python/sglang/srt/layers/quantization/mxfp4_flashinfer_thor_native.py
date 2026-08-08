@@ -29,6 +29,11 @@ _QUANT_VECTOR_MIN_TOKENS = int(
 )
 if _QUANT_VECTOR_MIN_TOKENS < 1:
     raise ValueError("SGLANG_THOR_MXFP8_VECTOR_MIN_TOKENS must be positive")
+_FUSED_DECODE_PACK = int(
+    os.environ.get("SGLANG_THOR_MXFP4_FUSED_DECODE_PACK", "0")
+)
+if _FUSED_DECODE_PACK not in (0, 1):
+    raise ValueError("SGLANG_THOR_MXFP4_FUSED_DECODE_PACK must be 0 or 1")
 _EAGER_WORKSPACES: dict[tuple, "NativeMxfp4Workspace"] = {}
 
 
@@ -142,6 +147,113 @@ def _route_count_small_kernel(
         expert_counts + safe_local_ids, 1, sem="relaxed", mask=valid
     )
     tl.store(route_to_packed + offsets, -1, mask=offsets < NUM_ROUTES)
+
+
+@triton.jit
+def _route_pack_decode_kernel(
+    topk_ids,
+    expert_map,
+    expert_counts,
+    packed_route_indices,
+    packed_route_count,
+    m_indptr,
+    active_expert_ids,
+    active_group_count,
+    expert_to_compact,
+    write_offsets,
+    route_to_packed,
+    block_expert_ids,
+    NUM_ROUTES: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    EXPERT_MAP_SIZE: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    MAX_GROUPS: tl.constexpr,
+    ROUTE_BLOCK: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+):
+    """Pack a decode route table in one CTA instead of four launches."""
+    routes = tl.arange(0, BLOCK_T)
+    experts = tl.arange(0, BLOCK_E)
+    route_mask = routes < NUM_ROUTES
+    expert_mask = experts < NUM_EXPERTS
+
+    tl.store(expert_counts + experts, 0, mask=expert_mask)
+    tl.store(route_to_packed + routes, -1, mask=route_mask)
+    tl.debug_barrier()
+
+    raw_ids = tl.load(topk_ids + routes, mask=route_mask, other=-1).to(tl.int32)
+    valid = route_mask & (raw_ids >= 0)
+    ids = raw_ids
+    if HAS_EXPERT_MAP:
+        valid = valid & (raw_ids < EXPERT_MAP_SIZE)
+        safe_ids = tl.minimum(tl.maximum(raw_ids, 0), EXPERT_MAP_SIZE - 1)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    else:
+        valid = valid & (raw_ids < NUM_EXPERTS)
+    safe_local_ids = tl.minimum(tl.maximum(ids, 0), NUM_EXPERTS - 1)
+    tl.atomic_add(expert_counts + safe_local_ids, 1, sem="relaxed", mask=valid)
+    tl.debug_barrier()
+
+    counts = tl.load(expert_counts + experts, mask=expert_mask, other=0)
+    padded = ((counts + ROUTE_BLOCK - 1) // ROUTE_BLOCK) * ROUTE_BLOCK
+    padded = tl.where(expert_mask, padded, 0)
+    inclusive = tl.cumsum(padded, axis=0)
+    prefix = inclusive - padded
+    total = tl.sum(padded, axis=0)
+    active = expert_mask & (counts > 0)
+    compact_group = tl.cumsum(active.to(tl.int32), axis=0) - 1
+    num_active_groups = tl.sum(active.to(tl.int32), axis=0)
+
+    tl.store(write_offsets + experts, prefix, mask=expert_mask)
+    tl.store(
+        expert_to_compact + experts,
+        tl.where(active, compact_group, -1),
+        mask=expert_mask,
+    )
+    tl.store(m_indptr + compact_group, prefix, mask=active)
+    tl.store(active_expert_ids + compact_group, experts, mask=active)
+    tl.store(m_indptr + num_active_groups, total)
+    tl.store(active_group_count, num_active_groups)
+    tl.store(packed_route_count, total)
+
+    groups = tl.arange(0, BLOCK_G)
+    tl.store(
+        active_expert_ids + groups,
+        0,
+        mask=(groups >= num_active_groups) & (groups < MAX_GROUPS),
+    )
+    tl.store(
+        m_indptr + groups,
+        total,
+        mask=(groups > num_active_groups) & (groups <= MAX_GROUPS),
+    )
+    for slot in tl.static_range(0, ROUTE_BLOCK - 1):
+        padding_index = prefix + counts + slot
+        tl.store(
+            packed_route_indices + padding_index,
+            NUM_ROUTES,
+            mask=expert_mask & (slot < (padded - counts)),
+        )
+    tl.debug_barrier()
+
+    packed = tl.atomic_add(
+        write_offsets + safe_local_ids, 1, sem="relaxed", mask=valid
+    )
+    tl.store(packed_route_indices + packed, routes, mask=valid)
+    tl.store(route_to_packed + routes, packed, mask=valid)
+    route_compact_group = tl.load(
+        expert_to_compact + safe_local_ids, mask=valid, other=0
+    )
+    # Expert row ranges are padded to ROUTE_BLOCK, so each packed block has
+    # at least one real route. Races only store the same compact group value.
+    tl.store(
+        block_expert_ids + packed // ROUTE_BLOCK,
+        route_compact_group,
+        mask=valid,
+    )
 
 
 @triton.jit
@@ -637,6 +749,32 @@ def _pack_routes(
     block_g = _next_power_of_2(workspace.max_groups + 1)
     expert_map_tensor = expert_map if expert_map is not None else topk_ids
     expert_map_size = int(expert_map.numel()) if expert_map is not None else 0
+    if _FUSED_DECODE_PACK and num_routes <= _COUNT_BLOCK_T:
+        _route_pack_decode_kernel[(1,)](
+            topk_ids,
+            expert_map_tensor,
+            workspace.expert_counts,
+            workspace.packed_route_indices,
+            workspace.packed_route_count,
+            workspace.m_indptr,
+            workspace.active_expert_ids,
+            workspace.active_group_count,
+            workspace.expert_to_compact,
+            workspace.write_offsets,
+            workspace.route_to_packed,
+            workspace.block_expert_ids,
+            NUM_ROUTES=num_routes,
+            NUM_EXPERTS=workspace.num_experts,
+            EXPERT_MAP_SIZE=expert_map_size,
+            HAS_EXPERT_MAP=expert_map is not None,
+            MAX_GROUPS=workspace.max_groups,
+            ROUTE_BLOCK=_ROUTE_BLOCK,
+            BLOCK_T=_COUNT_BLOCK_T,
+            BLOCK_E=block_e,
+            BLOCK_G=block_g,
+            num_warps=8,
+        )
+        return
     if num_routes <= _COUNT_BLOCK_T:
         _route_count_small_kernel[(1,)](
             topk_ids,
