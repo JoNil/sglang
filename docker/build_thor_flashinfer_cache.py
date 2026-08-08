@@ -37,17 +37,27 @@ def get_w4_spec():
     return spec
 
 
-def get_w8_spec():
+def get_w8_spec(stages: int):
+    if stages not in (5, 6):
+        raise ValueError(f"Unsupported Thor W8 stage count: {stages}")
     base = gen_gemm_sm100_module()
     sources = [source for source in base.sources if source.name in W8_SOURCES]
     found = {source.name for source in sources}
     if found != W8_SOURCES:
         raise RuntimeError(f"Missing W8 sources: {sorted(W8_SOURCES - found)}")
-    return replace(base, name="gemm_sm100_w8_sm110_stage5", sources=sources)
+    cuda_flags = list(base.extra_cuda_cflags or [])
+    if stages == 6:
+        cuda_flags.append("-DSGLANG_THOR_W8_STAGE6=1")
+    return replace(
+        base,
+        name=f"gemm_sm100_w8_sm110_stage{stages}",
+        sources=sources,
+        extra_cuda_cflags=cuda_flags,
+    )
 
 
 def main() -> None:
-    for spec in (get_w4_spec(), get_w8_spec()):
+    for spec in (get_w4_spec(), get_w8_spec(5), get_w8_spec(6)):
         spec.build(verbose=True)
         print(f"Built {spec.name}: {spec.jit_library_path}", flush=True)
 

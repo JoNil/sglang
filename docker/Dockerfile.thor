@@ -41,9 +41,9 @@ RUN patch --batch --forward -p1 \
 
 # The generic W8 schedule consumes 230.4 KiB of dynamic shared memory on Thor.
 # Keep the arithmetic tile but cap its pipeline at five stages (101.38 KiB),
-# allowing two CTAs per SM. The SGLang runtime selects this source-JIT module
-# only when SGLANG_THOR_W8_PIPELINE_STAGES=5; zero retains FlashInfer's AOT
-# module for an exact same-image rollback/control arm.
+# allowing two CTAs per SM. A compile-time define also exposes the measured
+# six-stage control/candidate. The SGLang runtime can select either module or
+# dispatch by exact graph shape; zero retains FlashInfer's AOT module.
 COPY flashinfer-indexed/flashinfer-w8-sm110-stage5.patch \
     /tmp/flashinfer-w8-sm110-stage5.patch
 RUN patch --batch --forward -p1 \
