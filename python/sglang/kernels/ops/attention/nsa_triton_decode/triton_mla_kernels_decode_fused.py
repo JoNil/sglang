@@ -28,7 +28,7 @@ _THOR_DSV4_SPLITK_640 = int(
 )
 if _THOR_DSV4_SPLITK_640 not in (0, 1):
     raise ValueError("SGLANG_THOR_DSV4_SPLITK_640 must be 0 or 1")
-_THOR_DSV4_BLOCK_N16 = int(os.environ.get("SGLANG_THOR_DSV4_BLOCK_N16", "1"))
+_THOR_DSV4_BLOCK_N16 = int(os.environ.get("SGLANG_THOR_DSV4_BLOCK_N16", "0"))
 if _THOR_DSV4_BLOCK_N16 not in (0, 1):
     raise ValueError("SGLANG_THOR_DSV4_BLOCK_N16 must be 0 or 1")
 _IS_SM110: Optional[bool] = None
