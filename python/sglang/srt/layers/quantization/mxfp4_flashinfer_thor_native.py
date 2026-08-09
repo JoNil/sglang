@@ -24,6 +24,17 @@ if _QUANT_GROUPS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32, 64):
     raise ValueError(
         "SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM must be 1, 2, 4, 8, 16, 32, or 64"
     )
+_ROUTE_QUANT_GROUPS_PER_PROGRAM = int(
+    os.environ.get(
+        "SGLANG_THOR_MXFP8_ROUTE_GROUPS_PER_PROGRAM",
+        str(_QUANT_GROUPS_PER_PROGRAM),
+    )
+)
+if _ROUTE_QUANT_GROUPS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32, 64, 128):
+    raise ValueError(
+        "SGLANG_THOR_MXFP8_ROUTE_GROUPS_PER_PROGRAM must be "
+        "1, 2, 4, 8, 16, 32, 64, or 128"
+    )
 _QUANT_VECTOR_MIN_TOKENS = int(
     os.environ.get("SGLANG_THOR_MXFP8_VECTOR_MIN_TOKENS", "8")
 )
@@ -57,12 +68,26 @@ def max_active_groups(num_routes: int, num_experts: int) -> int:
 
 
 def quant_groups_per_program(num_tokens: int) -> int:
-    """Keep decode on width 16 and use the wider program for prefill."""
+    """Select the SwiGLU quantizer width, capped by its 64 groups."""
     if int(num_tokens) < _QUANT_VECTOR_MIN_TOKENS:
         return 1
     if int(num_tokens) < 64:
         return min(_QUANT_GROUPS_PER_PROGRAM, 16)
     return _QUANT_GROUPS_PER_PROGRAM
+
+
+def route_quant_groups_per_program(num_tokens: int) -> int:
+    """Use width 128 only in the token ranges where Thor measurements win."""
+    num_tokens = int(num_tokens)
+    if num_tokens < _QUANT_VECTOR_MIN_TOKENS:
+        return 1
+    if num_tokens < 64:
+        return min(_ROUTE_QUANT_GROUPS_PER_PROGRAM, 16)
+    if _ROUTE_QUANT_GROUPS_PER_PROGRAM == 128:
+        if 128 <= num_tokens < 512 or 1024 <= num_tokens < 2048:
+            return 128
+        return 64
+    return _ROUTE_QUANT_GROUPS_PER_PROGRAM
 
 
 @triton.jit
@@ -970,14 +995,12 @@ def native_mxfp4_moe(
     )
 
     input_sf_cols = _align_up(hidden // _QUANT_BLOCK, 4)
-    quant_groups = quant_groups_per_program(num_tokens)
-    quant_warps = 4 if quant_groups >= 4 else 1
+    route_quant_groups = route_quant_groups_per_program(num_tokens)
+    route_quant_warps = 4 if route_quant_groups >= 4 else 1
     _route_quantize_kernel[
         (
             active_max_rows,
-            triton.cdiv(
-                hidden // _QUANT_BLOCK, quant_groups
-            ),
+            triton.cdiv(hidden // _QUANT_BLOCK, route_quant_groups),
         )
     ](
         x,
@@ -993,8 +1016,8 @@ def native_mxfp4_moe(
         MAX_PACKED_ROWS=active_max_rows,
         ROUTE_BLOCK=_ROUTE_BLOCK,
         SCALE_COLS=input_sf_cols,
-        GROUPS_PER_PROGRAM=quant_groups,
-        num_warps=quant_warps,
+        GROUPS_PER_PROGRAM=route_quant_groups,
+        num_warps=route_quant_warps,
     )
 
     _indexed_group_gemm(
@@ -1011,6 +1034,8 @@ def native_mxfp4_moe(
     )
 
     act_sf_cols = _align_up(workspace.intermediate // _QUANT_BLOCK, 4)
+    quant_groups = quant_groups_per_program(num_tokens)
+    quant_warps = 4 if quant_groups >= 4 else 1
     _swiglu_quantize_kernel[
         (
             active_max_rows,

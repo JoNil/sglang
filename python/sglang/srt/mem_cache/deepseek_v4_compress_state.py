@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 from contextlib import nullcontext
 from math import gcd
+from typing import Callable, Optional
 
 import torch
 
@@ -13,6 +14,10 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+CompressStateBufferAllocator = Callable[
+    [tuple[int, int], torch.dtype, str], torch.Tensor
+]
 
 
 def _lcm(a: int, b: int) -> int:
@@ -95,6 +100,7 @@ class CompressStatePool:
         online: bool = False,
         swa_page_size: int = 0,
         online_mtp_max_draft_tokens: int = 0,
+        buffer_allocator: Optional[CompressStateBufferAllocator] = None,
     ):
         self.ratio = ratio
         self.ring_size = ring_size
@@ -126,7 +132,10 @@ class CompressStatePool:
 
         self.last_dim = last_dim
         self._alloc_kv_score_buffer(
-            dtype=dtype, device=device, enable_memory_saver=enable_memory_saver
+            dtype=dtype,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            buffer_allocator=buffer_allocator,
         )
         if not online:
             if _is_hip and ratio == 128:
@@ -141,7 +150,12 @@ class CompressStatePool:
                 self.kv_score_buffer[-1].clear()
 
     def _alloc_kv_score_buffer(
-        self, *, dtype: torch.dtype, device: str, enable_memory_saver: bool
+        self,
+        *,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        buffer_allocator: Optional[CompressStateBufferAllocator] = None,
     ) -> None:
         """Allocate the flat ``(self._size, self.last_dim)`` kv+score buffer
         under the memory-saver / custom-mem-pool context and wrap it in
@@ -159,6 +173,18 @@ class CompressStatePool:
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=device)
         )
+        if buffer_allocator is not None:
+            buffer = buffer_allocator((self._size, self.last_dim), dtype, device)
+            expected_device = torch.device(device)
+            assert tuple(buffer.shape) == (self._size, self.last_dim)
+            assert buffer.dtype == dtype
+            assert buffer.device.type == expected_device.type
+            if expected_device.index is not None:
+                assert buffer.device.index == expected_device.index
+            assert buffer.is_contiguous()
+            self.kv_score_buffer = KVAndScore(buffer)
+            return
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)

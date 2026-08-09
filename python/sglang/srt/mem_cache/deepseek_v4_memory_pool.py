@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from contextlib import nullcontext
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
@@ -19,7 +21,10 @@ from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStateBufferAllocator,
+    CompressStatePool,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_server_args, get_spec
 from sglang.srt.utils import ceil_div, is_hip
@@ -29,6 +34,9 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+_COALESCE_COMPRESS_STATES = (
+    os.environ.get("SGLANG_THOR_DSV4_COALESCE_STATES", "0") == "1"
+)
 
 
 def get_compress_state_ring_size(
@@ -481,6 +489,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
     ):
+        init_started = time.perf_counter()
         super().__init__(
             swa_size,
             page_size,
@@ -491,6 +500,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             start_layer,
             end_layer,
         )
+        base_finished = time.perf_counter()
         c4_logical_size = c128_size * 32
 
         logger.info(
@@ -632,6 +642,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=page_size,
             )
+        kv_finished = time.perf_counter()
 
         indexer_size = self.c4_logical_size
         self.c4_indexer_kv_pool = self._make_indexer_pool(
@@ -643,10 +654,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             device,
             enable_memory_saver,
         )
+        indexer_finished = time.perf_counter()
 
         self._init_compressed_layer_mapping()
 
         self._init_paged_compress_states(enable_memory_saver)
+        states_finished = time.perf_counter()
+        logger.info(
+            "DSV4 physical-pool timing: base=%.3f s, kv=%.3f s, "
+            "indexer=%.3f s, states=%.3f s, total=%.3f s",
+            base_finished - init_started,
+            kv_finished - base_finished,
+            indexer_finished - kv_finished,
+            states_finished - indexer_finished,
+            states_finished - init_started,
+        )
 
     def get_unified_kv(self, layer_id: int) -> torch.Tensor:
         # Under HiCache the compressed region is loaded H->D per layer; wait for this
@@ -877,7 +899,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         return self.c4_state_pool_size if ratio == 4 else self.c128_state_pool_size
 
     def _make_attn_state_pool(
-        self, ratio: int, enable_memory_saver: bool
+        self,
+        ratio: int,
+        enable_memory_saver: bool,
+        buffer_allocator: Optional[CompressStateBufferAllocator] = None,
     ) -> CompressStatePool:
         """Build the per-layer attention compress-state pool for ``ratio``
         (4 or 128). Overridden by :class:`DSV4NPUTokenToKVPool` to swap the
@@ -896,10 +921,14 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             online_mtp_max_draft_tokens=(
                 self.online_mtp_max_draft_tokens if ratio == 128 else 0
             ),
+            buffer_allocator=buffer_allocator,
         )
 
     def _make_indexer_state_pool(
-        self, ratio: int, enable_memory_saver: bool
+        self,
+        ratio: int,
+        enable_memory_saver: bool,
+        buffer_allocator: Optional[CompressStateBufferAllocator] = None,
     ) -> CompressStatePool:
         """Build the per-layer indexer compress-state pool (c4 only)."""
         return CompressStatePool(
@@ -912,30 +941,125 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             enable_memory_saver=enable_memory_saver,
             ratio=ratio,
             swa_page_size=self.swa_page_size,
+            buffer_allocator=buffer_allocator,
         )
 
+    def _make_layer_state_buffer_allocator(
+        self, name: str, num_layers: int
+    ) -> CompressStateBufferAllocator:
+        """Allocate one backing tensor and return contiguous per-layer views."""
+        assert num_layers > 0
+        backing: Optional[torch.Tensor] = None
+        next_layer = 0
+
+        def allocate(
+            shape: tuple[int, int], dtype: torch.dtype, device: str
+        ) -> torch.Tensor:
+            nonlocal backing, next_layer
+            if backing is None:
+                with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+                    with (
+                        torch.cuda.use_mem_pool(self.custom_mem_pool)
+                        if self.custom_mem_pool
+                        else nullcontext()
+                    ):
+                        backing = torch.empty(
+                            (num_layers, *shape), dtype=dtype, device=device
+                        )
+                self._compress_state_backings[name] = backing
+            else:
+                assert tuple(backing.shape[1:]) == shape
+                assert backing.dtype == dtype
+                assert backing.device.type == torch.device(device).type
+
+            assert next_layer < num_layers
+            view = backing[next_layer]
+            next_layer += 1
+            assert view.is_contiguous()
+            return view
+
+        return allocate
+
     def _init_paged_compress_states(self, enable_memory_saver: bool):
-        c4_state_pool_size = self.c4_state_pool_size
-        c128_state_pool_size = self.c128_state_pool_size
         total_L = len(self.compression_ratios)
         self.compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
         self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
             None
         ] * total_L
 
+        # NPU subclasses override the pool factories with a different paged
+        # layout, so retain their historical per-pool allocation path.
+        can_coalesce = (
+            type(self)._make_attn_state_pool
+            is DeepSeekV4TokenToKVPool._make_attn_state_pool
+            and type(self)._make_indexer_state_pool
+            is DeepSeekV4TokenToKVPool._make_indexer_state_pool
+        )
+        coalesce = _COALESCE_COMPRESS_STATES and can_coalesce
+        self._compress_state_backings: dict[str, torch.Tensor] = {}
+        attn_allocators: dict[int, CompressStateBufferAllocator] = {}
+        indexer_allocator: Optional[CompressStateBufferAllocator] = None
+        if coalesce:
+            stage_ratios = self.compression_ratios[
+                self._stage_start : self._stage_end
+            ]
+            c4_layers = sum(ratio == 4 for ratio in stage_ratios)
+            c128_layers = sum(ratio == 128 for ratio in stage_ratios)
+            if c4_layers:
+                attn_allocators[4] = self._make_layer_state_buffer_allocator(
+                    "c4_attention", c4_layers
+                )
+                indexer_allocator = self._make_layer_state_buffer_allocator(
+                    "c4_indexer", c4_layers
+                )
+            if c128_layers:
+                attn_allocators[128] = self._make_layer_state_buffer_allocator(
+                    "c128_attention", c128_layers
+                )
+            logger.info(
+                "Coalescing DSV4 compression states into %d backing allocations "
+                "(c4_layers=%d, c128_layers=%d)",
+                len(attn_allocators) + (indexer_allocator is not None),
+                c4_layers,
+                c128_layers,
+            )
+        elif _COALESCE_COMPRESS_STATES:
+            logger.info(
+                "DSV4 compression-state coalescing is unsupported by %s; "
+                "using per-layer allocations",
+                type(self).__name__,
+            )
+
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
             if ratio == 0:
                 continue
 
-            self.compress_state_pools[idx] = self._make_attn_state_pool(
-                ratio, enable_memory_saver
-            )
-
-            if ratio == 4:
-                self.indexer_compress_state_pools[idx] = self._make_indexer_state_pool(
+            if coalesce:
+                self.compress_state_pools[idx] = self._make_attn_state_pool(
+                    ratio,
+                    enable_memory_saver,
+                    buffer_allocator=attn_allocators[ratio],
+                )
+            else:
+                self.compress_state_pools[idx] = self._make_attn_state_pool(
                     ratio, enable_memory_saver
                 )
+
+            if ratio == 4:
+                if coalesce:
+                    assert indexer_allocator is not None
+                    self.indexer_compress_state_pools[idx] = (
+                        self._make_indexer_state_pool(
+                            ratio,
+                            enable_memory_saver,
+                            buffer_allocator=indexer_allocator,
+                        )
+                    )
+                else:
+                    self.indexer_compress_state_pools[idx] = (
+                        self._make_indexer_state_pool(ratio, enable_memory_saver)
+                    )
 
     def _init_compressed_layer_mapping(self):
         c1_cnt = c4_cnt = c128_cnt = 0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -233,6 +234,7 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        configure_started = time.perf_counter()
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None
@@ -242,17 +244,28 @@ class KVCacheConfigurator:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 
         sizes = self._derive_pool_sizes(config=config)
+        sizing_finished = time.perf_counter()
 
         pools = self._init_pools(
             sizes=sizes,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
+        pools_finished = time.perf_counter()
 
-        logger.info(
-            f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        available_memory_started = time.perf_counter()
+        available_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        available_memory_finished = time.perf_counter()
+        if is_deepseek_v4(self.model_config.hf_config):
+            logger.info(
+                "DSV4 pool timing: sizing=%.3f s, init=%.3f s, "
+                "available-memory=%.3f s, total=%.3f s",
+                sizing_finished - configure_started,
+                pools_finished - sizing_finished,
+                available_memory_finished - available_memory_started,
+                available_memory_finished - configure_started,
+            )
+        logger.info(f"Memory pool end. avail mem={available_memory:.2f} GB")
 
         return KVCacheConfigResult(
             max_total_num_tokens=sizes.max_total_num_tokens,
