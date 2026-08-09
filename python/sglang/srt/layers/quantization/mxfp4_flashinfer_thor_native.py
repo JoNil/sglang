@@ -18,11 +18,11 @@ _COUNT_BLOCK_T = 256
 _SORT_BLOCK_T = 256
 _QUANT_BLOCK = 32
 _QUANT_GROUPS_PER_PROGRAM = int(
-    os.environ.get("SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM", "16")
+    os.environ.get("SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM", "64")
 )
-if _QUANT_GROUPS_PER_PROGRAM not in (1, 2, 4, 8, 16):
+if _QUANT_GROUPS_PER_PROGRAM not in (1, 2, 4, 8, 16, 32, 64):
     raise ValueError(
-        "SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM must be 1, 2, 4, 8, or 16"
+        "SGLANG_THOR_MXFP8_GROUPS_PER_PROGRAM must be 1, 2, 4, 8, 16, 32, or 64"
     )
 _QUANT_VECTOR_MIN_TOKENS = int(
     os.environ.get("SGLANG_THOR_MXFP8_VECTOR_MIN_TOKENS", "8")
