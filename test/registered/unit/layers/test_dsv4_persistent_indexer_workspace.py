@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 
 
@@ -53,6 +54,32 @@ class TestPersistentTileLangIndexerWorkspace(unittest.TestCase):
         self.assertEqual(
             backend._persistent_tilelang_logits_workspace.numel(), 8 * 512
         )
+
+    def test_optional_pretouch_zeros_existing_backing(self):
+        backend = C4IndexerBackendMixin()
+        with envs.SGLANG_OPT_DSV4_PRETOUCH_TILELANG_LOGITS.override(False):
+            backend._get_persistent_tilelang_logits_output(
+                query_rows=2,
+                current_seq_len=128,
+                capacity_rows=4,
+                capacity_seq_len=256,
+                device=torch.device("cpu"),
+            )
+        backing = backend._persistent_tilelang_logits_workspace
+        backing.fill_(7)
+        self.assertFalse(backend._persistent_tilelang_logits_workspace_pretouched)
+
+        with envs.SGLANG_OPT_DSV4_PRETOUCH_TILELANG_LOGITS.override(True):
+            backend._get_persistent_tilelang_logits_output(
+                query_rows=2,
+                current_seq_len=128,
+                capacity_rows=4,
+                capacity_seq_len=256,
+                device=torch.device("cpu"),
+            )
+
+        self.assertTrue(backend._persistent_tilelang_logits_workspace_pretouched)
+        self.assertEqual(torch.count_nonzero(backing).item(), 0)
 
 
 if __name__ == "__main__":

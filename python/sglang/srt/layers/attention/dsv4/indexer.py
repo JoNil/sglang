@@ -409,6 +409,7 @@ class C4IndexerBackendMixin:
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
         self._persistent_tilelang_logits_workspace: Optional[torch.Tensor] = None
+        self._persistent_tilelang_logits_workspace_pretouched: bool = False
 
     def _get_persistent_tilelang_logits_output(
         self,
@@ -436,11 +437,27 @@ class C4IndexerBackendMixin:
                 device=device,
             )
             self._persistent_tilelang_logits_workspace = workspace
+            self._persistent_tilelang_logits_workspace_pretouched = False
             logger.info(
                 "Allocated persistent TileLang indexer logits workspace: "
                 "rows=%d seq_capacity=%d size_mib=%.1f",
                 capacity_rows,
                 capacity_seq_len,
+                workspace.nbytes / (1 << 20),
+            )
+
+        if (
+            envs.SGLANG_OPT_DSV4_PRETOUCH_TILELANG_LOGITS.get()
+            and not self._persistent_tilelang_logits_workspace_pretouched
+        ):
+            # CUDA/UVM allocation is lazy on Thor. Queue one full-buffer write
+            # on the current stream so every physical page is backed during
+            # warmup instead of faulting at 8K-token boundaries in serving.
+            workspace.zero_()
+            self._persistent_tilelang_logits_workspace_pretouched = True
+            logger.info(
+                "Pre-touched persistent TileLang indexer logits workspace: "
+                "size_mib=%.1f",
                 workspace.nbytes / (1 << 20),
             )
 

@@ -1141,6 +1141,10 @@ class Envs:
     # This trades a bounded persistent allocation for lower allocator/UVM
     # fragmentation on unified-memory systems. Disabled by default.
     SGLANG_OPT_DSV4_PERSISTENT_TILELANG_LOGITS = EnvBool(False)
+    # Physically touch the complete persistent logits workspace once before it
+    # enters serving. This trades startup work for avoiding incremental UVM
+    # first-touch stalls as a long DSV4 context crosses new C4 extents.
+    SGLANG_OPT_DSV4_PRETOUCH_TILELANG_LOGITS = EnvBool(False)
     SGLANG_OPT_USE_AITER_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
