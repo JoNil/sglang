@@ -122,6 +122,18 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 self._init_and_check(scheduler, req), max_req_len - input_len - 1
             )
 
+    def test_full_context_mode_uses_last_logical_slot(self):
+        max_req_len, input_len = 32, 31
+        with envs.SGLANG_ENABLE_FULL_CONTEXT_REQUESTS.override(True):
+            scheduler = self._new_scheduler(
+                max_req_len=max_req_len,
+                max_total_num_tokens=max_req_len + 4,
+                page_size=1,
+            )
+            req = self._new_req(max_new_tokens=1, input_len=input_len)
+            scheduler.init_req_max_new_tokens(req)
+            self.assertEqual(req.sampling_params.max_new_tokens, 1)
+
     def test_budget_rule_binds_tighter_than_limit(self):
         max_total_num_tokens, page_size, input_len = 24, 4, 8
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(32):

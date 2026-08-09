@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -483,17 +484,33 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens - 1,
-        )
+        if envs.SGLANG_ENABLE_FULL_CONTEXT_REQUESTS.get():
+            # PrefillAdder and alloc_extend require a full alignment page plus
+            # one sentinel slot beyond the logical request. Keep that physical
+            # reserve out of the public input+output context window. If startup
+            # did not provision enough pool headroom, fail safe by advertising
+            # the smaller schedulable limit instead of queueing an impossible
+            # request forever.
+            max_req_len = min(
+                self.model_config.context_len,
+                self.model_runner.effective_max_total_num_tokens
+                - self.server_args.page_size
+                - 1,
+            )
+            max_req_input_len = max_req_len
+        else:
+            max_req_len = min(
+                self.model_config.context_len - 1,
+                self.model_runner.effective_max_total_num_tokens - 1,
+            )
+            max_req_input_len = max_req_len - 5
         return (
             self.model_runner.max_total_num_tokens,
             get_schedule().max_prefill_tokens,
             self.model_runner.max_running_requests,
             get_schedule().max_queued_requests,
             max_req_len,
-            max_req_len - 5,
+            max_req_input_len,
             self.random_seed,
             self.device,
             self.model_runner.forward_stream,

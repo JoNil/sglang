@@ -1668,10 +1668,16 @@ class KVCacheConfigurator:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
-                logging.warning(
+                message = (
                     f"max_total_tokens={user_limit} is larger than the profiled value "
-                    f"{token_capacity}. Use the profiled value instead."
+                    f"{token_capacity}."
                 )
+                if envs.SGLANG_REQUIRE_MAX_TOTAL_TOKENS.get():
+                    raise RuntimeError(
+                        f"{message} Refusing to start because "
+                        "SGLANG_REQUIRE_MAX_TOTAL_TOKENS is enabled."
+                    )
+                logging.warning(f"{message} Use the profiled value instead.")
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)

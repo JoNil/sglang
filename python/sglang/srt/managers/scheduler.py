@@ -2075,11 +2075,14 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        context_sentinel = (
+            0 if envs.SGLANG_ENABLE_FULL_CONTEXT_REQUESTS.get() else 1
+        )
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len - context_sentinel,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )

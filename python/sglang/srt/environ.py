@@ -379,6 +379,13 @@ class Envs:
 
     # size the KV pool after CUDA-graph capture
     SGLANG_ENABLE_POST_CAPTURE_KV_SIZING = EnvBool(False)
+    # Fail startup instead of silently clamping --max-total-tokens below the
+    # requested value when memory profiling cannot satisfy the serving contract.
+    SGLANG_REQUIRE_MAX_TOTAL_TOKENS = EnvBool(False)
+    # Allow requests to use the complete model context window. This requires
+    # --max-total-tokens to include allocator/page headroom above context_length.
+    # Without the headroom the worker reduces the advertised request limit.
+    SGLANG_ENABLE_FULL_CONTEXT_REQUESTS = EnvBool(False)
 
     # Scheduler: memory leak test
     SGLANG_TEST_RETRACT = EnvBool(False)
