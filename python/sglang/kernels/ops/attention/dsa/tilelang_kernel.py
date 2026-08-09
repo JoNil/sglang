@@ -1488,6 +1488,7 @@ def tilelang_fp8_paged_mqa_logits(
     deep_gemm_metadata: Any,
     max_seq_len: int,
     clean_logits: bool = True,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
@@ -1501,7 +1502,17 @@ def tilelang_fp8_paged_mqa_logits(
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
-    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    output_numel = batch_size * max_seq_len
+    if output is None:
+        logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    else:
+        assert output.device == page_table.device
+        assert output.dtype == torch.float32
+        assert output.is_contiguous()
+        assert output.numel() >= output_numel
+        # Use a flat prefix so the active (batch, sequence) view stays
+        # contiguous even when the persistent backing is wider than this step.
+        logits = output.view(-1)[:output_numel].view(batch_size, max_seq_len)
 
     NUM_CU = 256
     split_kv = split_kv = max(1, min(max_seq_len // block_size, NUM_CU // batch_size))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -40,7 +41,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm110_supported, is_sm120_supported
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+logger = logging.getLogger(__name__)
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -406,6 +408,44 @@ class C4IndexerBackendMixin:
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self._persistent_tilelang_logits_workspace: Optional[torch.Tensor] = None
+
+    def _get_persistent_tilelang_logits_output(
+        self,
+        *,
+        query_rows: int,
+        current_seq_len: int,
+        capacity_rows: int,
+        capacity_seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        assert query_rows > 0
+        assert current_seq_len > 0
+        assert capacity_rows >= query_rows
+        assert capacity_seq_len >= current_seq_len
+        required_numel = capacity_rows * capacity_seq_len
+        workspace = self._persistent_tilelang_logits_workspace
+        if (
+            workspace is None
+            or workspace.device != device
+            or workspace.numel() < required_numel
+        ):
+            workspace = torch.empty(
+                required_numel,
+                dtype=torch.float32,
+                device=device,
+            )
+            self._persistent_tilelang_logits_workspace = workspace
+            logger.info(
+                "Allocated persistent TileLang indexer logits workspace: "
+                "rows=%d seq_capacity=%d size_mib=%.1f",
+                capacity_rows,
+                capacity_seq_len,
+                workspace.nbytes / (1 << 20),
+            )
+
+        active_numel = query_rows * current_seq_len
+        return workspace[:active_numel].view(query_rows, current_seq_len)
 
     def _forward_prepare_multi_stream(
         self,
@@ -773,7 +813,28 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                 c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
             )
-            logits = fn(
+            tilelang_output = None
+            if (
+                _use_tilelang
+                and envs.SGLANG_OPT_DSV4_PERSISTENT_TILELANG_LOGITS.get()
+                and forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_cuda_graph()
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                configured_chunk_rows = get_server_args().chunked_prefill_size
+                capacity_rows = max(query_rows, configured_chunk_rows)
+                capacity_seq_len = (
+                    c4_indexer_kv_cache.shape[0] * indexer_metadata.c4_page_size
+                )
+                tilelang_output = self._get_persistent_tilelang_logits_output(
+                    query_rows=query_rows,
+                    current_seq_len=indexer_metadata.max_c4_seq_len,
+                    capacity_rows=capacity_rows,
+                    capacity_seq_len=capacity_seq_len,
+                    device=q.device,
+                )
+
+            indexer_args = (
                 q,
                 c4_indexer_kv_cache,
                 weights,
@@ -783,6 +844,10 @@ class C4IndexerBackendMixin:
                 indexer_metadata.max_c4_seq_len,
                 False,
             )
+            if _use_tilelang:
+                logits = fn(*indexer_args, output=tilelang_output)
+            else:
+                logits = fn(*indexer_args)
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
