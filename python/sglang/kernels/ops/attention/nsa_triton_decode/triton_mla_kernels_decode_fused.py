@@ -29,8 +29,8 @@ _THOR_DSV4_SPLITK_640 = int(
 if _THOR_DSV4_SPLITK_640 not in (0, 1):
     raise ValueError("SGLANG_THOR_DSV4_SPLITK_640 must be 0 or 1")
 _THOR_DSV4_BLOCK_N16 = int(os.environ.get("SGLANG_THOR_DSV4_BLOCK_N16", "0"))
-if _THOR_DSV4_BLOCK_N16 not in (0, 1):
-    raise ValueError("SGLANG_THOR_DSV4_BLOCK_N16 must be 0 or 1")
+if _THOR_DSV4_BLOCK_N16 not in (0, 1, 2, 3):
+    raise ValueError("SGLANG_THOR_DSV4_BLOCK_N16 must be 0, 1, 2, or 3")
 _IS_SM110: Optional[bool] = None
 
 
@@ -1303,10 +1303,43 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
 # ============================================================================
 
 
+def _prune_thor_splitk_configs(configs, named_args, **kwargs):
+    """Keep target/draft N=16 experiments independent and reproducible.
+
+    Modes are 0=off, 1=all shapes (the original experiment), 2=target M=7
+    only, and 3=draft M=6 only.  M=6 and M=7 previously shared the same
+    power-of-two autotune key, so whichever graph captured first selected the
+    reduction order for both.  Exact-token keys plus this pruning let serving
+    isolate one side while pinning the other to the validated N=64 reduction
+    order.  Its original four/eight-warp autotune choice remains available.
+    Batch-two M=12/14 and all other shapes stay on the normal config set for
+    targeted modes.
+    """
+    total_tokens = int(named_args.get("total_tokens", 0))
+    if total_tokens not in (6, 7):
+        if _THOR_DSV4_BLOCK_N16 in (2, 3):
+            baseline = [c for c in configs if c.kwargs.get("BLOCK_N") != 16]
+            return baseline or configs
+        return configs
+
+    use_n16 = _THOR_DSV4_BLOCK_N16 == 1 or (
+        _THOR_DSV4_BLOCK_N16 == 2 and total_tokens == 7
+    ) or (_THOR_DSV4_BLOCK_N16 == 3 and total_tokens == 6)
+    block_n = 16 if use_n16 else 64
+    selected = [
+        c
+        for c in configs
+        if c.kwargs.get("BLOCK_H") == 16
+        and c.kwargs.get("BLOCK_N") == block_n
+        and (block_n != 16 or c.num_warps == 4)
+    ]
+    return selected or configs
+
+
 @triton.autotune(
     configs=(
         [triton.Config({"BLOCK_H": 16, "BLOCK_N": 16}, num_warps=4, num_stages=1)]
-        if _THOR_DSV4_BLOCK_N16
+        if _THOR_DSV4_BLOCK_N16 != 0
         else []
     )
     + [
@@ -1318,7 +1351,8 @@ def _fused_gather_attn_dsv4_dual_scope_kernel(
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 128}, num_warps=8, num_stages=1),
         triton.Config({"BLOCK_H": 16, "BLOCK_N": 32}, num_warps=8, num_stages=1),
     ],
-    key=["total_tokens_bucket", "h_q", "topk_per_split"],
+    key=["total_tokens", "total_tokens_bucket", "h_q", "topk_per_split"],
+    prune_configs_by={"early_config_prune": _prune_thor_splitk_configs},
 )
 @triton.jit
 def _fused_gather_attn_dsv4_dual_scope_splitk_kernel(
