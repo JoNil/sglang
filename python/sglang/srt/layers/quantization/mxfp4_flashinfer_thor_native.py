@@ -57,9 +57,11 @@ def max_active_groups(num_routes: int, num_experts: int) -> int:
 
 
 def quant_groups_per_program(num_tokens: int) -> int:
-    """Keep latency-optimal scalar groups for batch-one decode."""
+    """Keep decode on width 16 and use the wider program for prefill."""
     if int(num_tokens) < _QUANT_VECTOR_MIN_TOKENS:
         return 1
+    if int(num_tokens) < 64:
+        return min(_QUANT_GROUPS_PER_PROGRAM, 16)
     return _QUANT_GROUPS_PER_PROGRAM
 
 
